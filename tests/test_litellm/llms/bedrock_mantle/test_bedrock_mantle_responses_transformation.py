@@ -190,6 +190,36 @@ class TestBedrockMantleResponsesAuth:
             is True
         )
 
+    def test_standard_path_still_uses_bearer_auth(self, monkeypatch):
+        monkeypatch.setenv("BEDROCK_MANTLE_API_KEY", "env-key")
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        cfg = BedrockMantleResponsesAPIConfig(use_openai_path=False)
+        headers = cfg.validate_environment(
+            headers={},
+            model="openai.gpt-oss-120b",
+            litellm_params=GenericLiteLLMParams(),
+        )
+        assert headers["Authorization"] == "Bearer env-key"
+
+    def test_standard_path_opts_out_of_native_features(self):
+        cfg = BedrockMantleResponsesAPIConfig(use_openai_path=False)
+        assert cfg.supports_native_file_search() is False
+        assert cfg.supports_native_websocket() is False
+
+
+class TestBedrockMantleResponsesRequestBody:
+    def test_standard_path_outbound_body_carries_bare_model(self):
+        cfg = BedrockMantleResponsesAPIConfig(use_openai_path=False)
+        body = cfg.transform_responses_api_request(
+            model="openai.gpt-oss-120b",
+            input="hello",
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+        assert body["model"] == "openai.gpt-oss-120b"
+        assert "input" in body
+
 
 class TestBedrockMantleResponsesRegistry:
     def test_registry_returns_config_for_gpt_5_5(self):
