@@ -23,6 +23,9 @@
 - `AmazonInvokeConfig.sign_request` (`litellm/llms/bedrock/chat/invoke_transformations/base_invoke_transformation.py:114`) is the reference: a thin forward to `self._sign_request(service_name="bedrock", ...)`. Mantle's override mirrors it but uses the composed signer and resolves the Mantle bearer first.
 - Existing chat/embedding signed-body pattern to mirror: `litellm/llms/custom_httpx/llm_http_handler.py` ~896-956 (`headers, signed_body = provider_config.sign_request(...)` then `if signed_body is not None: post(data=signed_body) else: post(json=data)`).
 - Registry already returns the Mantle config (`litellm/utils.py:8920`); **no routing/registry change in this plan.**
+- **Region must be a single source of truth (adversarial-review finding).** The existing `get_complete_url` resolves region from `BEDROCK_MANTLE_REGION` -> `AWS_REGION` -> default and does **not** read `litellm_params.aws_region_name` or `AWS_REGION_NAME`. But signing's `_get_aws_region_name` reads `optional_params["aws_region_name"]` -> `AWS_REGION_NAME` -> `AWS_REGION` first. So a caller passing `aws_region_name=us-east-2` with no region env gets a URL host for the *default* region but a SigV4 scope for `us-east-2` -> host/scope mismatch -> 401. The fix (Task 3a) routes both through one `_resolve_region(params)` helper and injects the resolved region into `optional_params` before signing.
+- **Caller `Authorization` can clobber SigV4 (adversarial-review finding).** The handler does `headers.update(extra_headers)` after `validate_environment`; once `validate_environment` no longer forces a Bearer header, a caller-supplied `extra_headers["Authorization"]` lands in `headers`. `_sign_request` re-applies original `Authorization` after SigV4 signing (`base_aws_llm.py:1556-1559`, "prevent sigv4 from overwriting the auth header"), so that stale header would override the SigV4 `Authorization`. The fix (Task 3a): in the SigV4 branch (no bearer) strip any incoming `Authorization` before signing.
+- By-id responses subroutes (`delete`/`get`/`cancel`/`compact`/`list_input_items`) call `get_provider_responses_api_config` with `model=None`; the Mantle gate (`litellm/utils.py:8915-8920`) returns `None` for `model=None`, so the Mantle SigV4 config never applies to them. They are out of scope here and need no signing (verified; this is why the adversarial-review "unsigned subroutes" concern does not apply).
 
 ## File Structure
 
@@ -495,7 +498,27 @@ Add an `__init__` (just after the class line `class BedrockMantleResponsesAPICon
         self._aws_signer = aws_signer or BaseAWSLLM()
 ```
 
-Add the `sign_request` override at the end of the class (after `supports_native_websocket`). It resolves the Mantle bearer chain, forwards to the shared `_sign_request`, and converts the unhelpful no-credentials error into a message naming both auth paths:
+Add a single region resolver so the URL host and the SigV4 credential scope can never diverge (adversarial-review fix). Place it as a static method on the class. Its precedence puts `litellm_params.aws_region_name` first (matching what the signer's `_get_aws_region_name` reads first), then the Mantle/AWS env vars, then the default:
+
+```python
+    @staticmethod
+    def _resolve_region(litellm_params: dict) -> str:
+        return (
+            litellm_params.get("aws_region_name")
+            or get_secret_str("BEDROCK_MANTLE_REGION")
+            or get_secret_str("AWS_REGION_NAME")
+            or get_secret_str("AWS_REGION")
+            or BEDROCK_MANTLE_DEFAULT_REGION
+        )
+```
+
+Replace the region line in `get_complete_url` (currently `region = (get_secret_str("BEDROCK_MANTLE_REGION") or get_secret_str("AWS_REGION") or BEDROCK_MANTLE_DEFAULT_REGION)`) with a call to the resolver, so a caller-supplied `aws_region_name` shapes the host:
+
+```python
+        region = self._resolve_region(litellm_params)
+```
+
+Add the `sign_request` override at the end of the class (after `supports_native_websocket`). It (1) resolves the Mantle bearer chain; (2) for the SigV4 path, pins `optional_params["aws_region_name"]` to the same resolved region the URL used and strips any caller-supplied `Authorization` so the signer's "restore original Authorization" step cannot clobber the SigV4 header; (3) forwards to the shared `_sign_request`; (4) converts the unhelpful no-credentials error into a message naming both auth paths:
 
 ```python
     def sign_request(
@@ -514,6 +537,17 @@ Add the `sign_request` override at the end of the class (after `supports_native_
             or get_secret_str("BEDROCK_MANTLE_API_KEY")
             or get_secret_str("AWS_BEARER_TOKEN_BEDROCK")
         )
+        if not bearer:
+            # SigV4 path. Pin the credential-scope region to the same region the URL
+            # host uses, and drop any caller Authorization so _sign_request's
+            # restore-original-Authorization step cannot override the SigV4 header.
+            optional_params = {
+                **optional_params,
+                "aws_region_name": self._resolve_region(optional_params),
+            }
+            headers = {
+                k: v for k, v in headers.items() if k.lower() != "authorization"
+            }
         try:
             return self._aws_signer._sign_request(
                 service_name="bedrock",
@@ -534,6 +568,8 @@ Add the `sign_request` override at the end of the class (after `supports_native_
                 "(IAM role / access key / profile / web identity) for SigV4."
             ) from e
 ```
+
+Note `_resolve_region` is fed `optional_params` here; in the handler the signer receives `optional_params=dict(litellm_params)`, so `aws_region_name` (and the same env fallbacks) are visible to both the URL builder and the signer. The URL builder is passed `litellm_params` directly, so both call sites resolve identically.
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -564,7 +600,7 @@ Append to class `TestBedrockMantleResponsesSigV4` in the Mantle test file:
         headers, signed_body = cfg.sign_request(
             headers={},
             optional_params={
-                "aws_access_key_id": "AKIATESTTESTTESTTEST",
+                "aws_access_key_id": "AKIAEXAMPLE",
                 "aws_secret_access_key": "c2VjcmV0LXRlc3Qtc2VjcmV0LXRlc3Qtc2VjcmV0",
                 "aws_session_token": "session-token-test",
                 "aws_region_name": "us-east-2",
@@ -574,7 +610,7 @@ Append to class `TestBedrockMantleResponsesSigV4` in the Mantle test file:
             api_key=None,
         )
         assert headers["Authorization"].startswith("AWS4-HMAC-SHA256")
-        assert "Credential=AKIATESTTESTTESTTEST/" in headers["Authorization"]
+        assert "Credential=AKIAEXAMPLE/" in headers["Authorization"]
         assert "/us-east-2/bedrock/aws4_request" in headers["Authorization"]
         assert "X-Amz-Date" in headers
         assert headers["X-Amz-Security-Token"] == "session-token-test"
@@ -591,7 +627,7 @@ Append to class `TestBedrockMantleResponsesSigV4` in the Mantle test file:
         signer = BaseAWSLLM()
         signer.get_credentials = MagicMock(
             return_value=Credentials(
-                access_key="ASIAASSUMEDROLEKEY00",
+                access_key="ASIAEXAMPLE",
                 secret_key="YXNzdW1lZC1yb2xlLXNlY3JldC1hc3N1bWVk",
                 token="assumed-session-token",
             )
@@ -633,7 +669,7 @@ Append to class `TestBedrockMantleResponsesSigV4` in the Mantle test file:
         _, signed_body = cfg.sign_request(
             headers={},
             optional_params={
-                "aws_access_key_id": "AKIATESTTESTTESTTEST",
+                "aws_access_key_id": "AKIAEXAMPLE",
                 "aws_secret_access_key": "c2VjcmV0LXRlc3Qtc2VjcmV0LXRlc3Qtc2VjcmV0",
                 "aws_region_name": "us-east-2",
             },
@@ -656,7 +692,7 @@ Append to class `TestBedrockMantleResponsesSigV4` in the Mantle test file:
         headers, _ = cfg.sign_request(
             headers={},
             optional_params={
-                "aws_access_key_id": "AKIATESTTESTTESTTEST",
+                "aws_access_key_id": "AKIAEXAMPLE",
                 "aws_secret_access_key": "c2VjcmV0LXRlc3Qtc2VjcmV0LXRlc3Qtc2VjcmV0",
                 "aws_region_name": "eu-west-1",
             },
@@ -665,11 +701,68 @@ Append to class `TestBedrockMantleResponsesSigV4` in the Mantle test file:
             api_key=None,
         )
         assert "/eu-west-1/bedrock/aws4_request" in headers["Authorization"]
+
+    def test_url_region_and_sigv4_region_agree_from_litellm_params(self, monkeypatch):
+        """Adversarial-review regression: a caller-supplied aws_region_name (no region
+        env set) must shape BOTH the URL host and the SigV4 credential scope, or the
+        request is signed for one region and sent to another -> 401.
+        """
+        monkeypatch.delenv("BEDROCK_MANTLE_REGION", raising=False)
+        monkeypatch.delenv("BEDROCK_MANTLE_API_BASE", raising=False)
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_REGION_NAME", raising=False)
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        monkeypatch.delenv("BEDROCK_MANTLE_API_KEY", raising=False)
+
+        from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
+
+        params = {
+            "aws_region_name": "ap-southeast-2",
+            "aws_access_key_id": "AKIAEXAMPLE",
+            "aws_secret_access_key": "c2VjcmV0LXRlc3Qtc2VjcmV0LXRlc3Qtc2VjcmV0",
+        }
+        cfg = BedrockMantleResponsesAPIConfig(aws_signer=BaseAWSLLM())
+        url = cfg.get_complete_url(api_base=None, litellm_params=params)
+        assert url == "https://bedrock-mantle.ap-southeast-2.api.aws/openai/v1/responses"
+
+        headers, _ = cfg.sign_request(
+            headers={},
+            optional_params=params,
+            request_data={"input": "hi"},
+            api_base=url,
+            api_key=None,
+        )
+        assert "/ap-southeast-2/bedrock/aws4_request" in headers["Authorization"]
+
+    def test_caller_authorization_does_not_override_sigv4(self, monkeypatch):
+        """Adversarial-review regression: a caller-supplied Authorization header (e.g.
+        from extra_headers, surviving the relaxed validate_environment) must not clobber
+        the SigV4 Authorization that _sign_request would otherwise restore.
+        """
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        monkeypatch.delenv("BEDROCK_MANTLE_API_KEY", raising=False)
+
+        from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
+
+        cfg = BedrockMantleResponsesAPIConfig(aws_signer=BaseAWSLLM())
+        headers, _ = cfg.sign_request(
+            headers={"Authorization": "Bearer stale-caller-token"},
+            optional_params={
+                "aws_access_key_id": "AKIAEXAMPLE",
+                "aws_secret_access_key": "c2VjcmV0LXRlc3Qtc2VjcmV0LXRlc3Qtc2VjcmV0",
+                "aws_region_name": "us-east-2",
+            },
+            request_data={"input": "hi"},
+            api_base="https://bedrock-mantle.us-east-2.api.aws/openai/v1/responses",
+            api_key=None,
+        )
+        assert headers["Authorization"].startswith("AWS4-HMAC-SHA256")
+        assert "Bearer stale-caller-token" not in headers["Authorization"]
 ```
 
 - [ ] **Step 2: Run to verify they pass**
 
-These exercise the code from 3a (no new product code needed). Run:
+These exercise the code from 3a (the `sign_request` override, the `_resolve_region` helper, and the `get_complete_url` region change). Run:
 `python -m pytest tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py::TestBedrockMantleResponsesSigV4 -v`
 Expected: PASS. If `test_access_key_produces_sigv4_headers` fails on header casing, inspect the real header keys it produced and adjust the assertions to match botocore's output (do not change product code).
 
@@ -677,7 +770,7 @@ Expected: PASS. If `test_access_key_produces_sigv4_headers` fails on header casi
 
 ```bash
 git add tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py
-git commit -m "test(bedrock_mantle): cover SigV4 access-key, AssumeRole, body-byte consistency, region"
+git commit -m "test(bedrock_mantle): cover SigV4 access-key, AssumeRole, body bytes, region/auth consistency"
 ```
 
 ### 3c. Relax `validate_environment` + both-auth-missing error message
@@ -839,9 +932,16 @@ Expected: no errors. If `make format` reformats files, re-run Step 1.
 
 - [ ] **Step 4: Commit any formatting changes**
 
+Stage only the files this plan touches (never `git add -A`, which could sweep in unrelated worktree changes):
+
 ```bash
-git add -A
-git commit -m "chore: format and lint mantle responses sigv4 changes" || echo "nothing to format"
+git add \
+  litellm/llms/base_llm/responses/transformation.py \
+  litellm/llms/custom_httpx/llm_http_handler.py \
+  litellm/llms/bedrock_mantle/responses/transformation.py \
+  tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py \
+  tests/test_litellm/llms/custom_httpx/test_llm_http_handler.py
+git diff --cached --quiet || git commit -m "chore: format and lint mantle responses sigv4 changes"
 ```
 
 ---
@@ -897,11 +997,15 @@ Base = `litellm_oss_staging_040626` (not `main`, not `litellm_internal_staging`;
 | §9.5 region + URL unchanged | Task 3b + existing URL tests (unchanged) |
 | §9.6 both-missing error names both paths | Task 3c `test_no_bearer_and_no_credentials_raises_both_paths` |
 | §9.7 handler regression: no-op stays json | Task 2 `test_responses_handler_sends_json_when_not_signed` |
+| Region single-source-of-truth (adversarial-review fix): URL host region == SigV4 scope region | Task 3a `_resolve_region` + `get_complete_url` change; Task 3b `test_url_region_and_sigv4_region_agree_from_litellm_params` |
+| Caller `Authorization` cannot clobber SigV4 (adversarial-review fix) | Task 3a SigV4-branch strip; Task 3b `test_caller_authorization_does_not_override_sigv4` |
 | §8 no impact on other providers | Task 5 Step 2 |
 | §10 live Proof of Fix | Task 6 Step 2 |
 | §11 branch/PR/base/secrets | Task 6 Step 3 |
 
 No gaps.
+
+**Adversarial-review disposition (Codex):** Two findings were real and are now fixed above — region divergence between `get_complete_url` and signing (3a `_resolve_region`), and caller `Authorization` overriding the SigV4 header (3a SigV4-branch strip). Two were hygiene improvements applied — fake AWS keys now use the repo's `AKIAEXAMPLE`/`ASIAEXAMPLE` convention, and Task 5 stages explicit paths instead of `git add -A`. The remaining findings did not apply: the "79-commit/372-file" target inconsistency and "code still Bearer-only" were artifacts of the reviewer diffing against `litellm_internal_staging` (the actual branch delta is the docs, and we are reviewing a plan, not merged code); the "unsigned by-id subroutes" concern does not hold because `delete`/`get`/`cancel`/`compact`/`list_input_items` call the registry with `model=None`, which returns `None` for Mantle so the SigV4 config never applies to them; and the local-hook/`--no-verify`/secret-scan-on-commit concerns do not apply because the repo has no local git hooks (secret scanning is CI-only via ggshield, and `test_no_hardcoded_secrets.py` only matches `Basic <base64>` strings, not AWS keys).
 
 **2. Placeholder scan:** No TBD/TODO/"handle edge cases"/"similar to". Every code step shows full code; every test step shows full test bodies.
 

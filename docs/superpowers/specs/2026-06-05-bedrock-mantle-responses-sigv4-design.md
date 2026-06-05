@@ -165,8 +165,18 @@ def sign_request(self, headers, optional_params, request_data, api_base,
 3. 都拿不到 → `_sign_request` 内 `get_credentials` 报错;Mantle config 负责把错误文案更新为**同时提示 bearer 和 IAM
    两条路**。
 
-region 解析复用 `BaseAWSLLM._get_aws_region_name(optional_params)`(`aws_region_name` →
-`AWS_REGION_NAME` → `AWS_REGION`),与 Mantle 现有 `get_complete_url` 的 region 来源保持一致。
+**region 必须单一真源(对抗式 review 修正)。** 原先以为 `get_complete_url` 与签名的 region 来源"天然一致",核验后发现并不一致:
+`get_complete_url` 读 `BEDROCK_MANTLE_REGION` → `AWS_REGION` → 默认,**不读** `litellm_params.aws_region_name` /
+`AWS_REGION_NAME`;而签名侧 `_get_aws_region_name` 优先读 `optional_params["aws_region_name"]` → `AWS_REGION_NAME` →
+`AWS_REGION`。调用方只传 `aws_region_name`(无 region 环境变量)时,URL host 用默认 region、SigV4 scope 用 `aws_region_name`
+→ host 与签名 scope 不一致 → 401。修正:引入单一 `_resolve_region(params)`(优先级 `aws_region_name` →
+`BEDROCK_MANTLE_REGION` → `AWS_REGION_NAME` → `AWS_REGION` → 默认),`get_complete_url` 用它决定 host;`sign_request`
+在 SigV4 分支把同一个 resolved region 注入 `optional_params["aws_region_name"]` 再签名,两侧 region 永不分叉。
+
+**调用方 `Authorization` 不得覆盖 SigV4(对抗式 review 修正)。** handler 在 `validate_environment` 后执行
+`headers.update(extra_headers)`;`validate_environment` 放松后,调用方塞进 `extra_headers["Authorization"]` 会进入
+`headers`,而 `_sign_request` 在 SigV4 签名末尾会"恢复原始 Authorization"(`base_aws_llm.py:1556-1559`),导致 SigV4 头被这个
+陈旧 Authorization 覆盖。修正:`sign_request` 的 SigV4 分支(无 bearer)在签名前剥掉传入的 `Authorization`。
 
 ---
 
@@ -184,8 +194,17 @@ region 解析复用 `BaseAWSLLM._get_aws_region_name(optional_params)`(`aws_regi
   一个 config。
 - **不碰** transform / streaming 解析 / file_search emulation / price-map / URL 构造。
 
-**唯一新增风险**:SigV4 路径自身的 body 字节一致性(签名 hash 的字节必须 = 实际发送字节)。由 §9 测试第 4 条专门锁死,
-并通过「`sign_request` 返回同一份 `_sign_request` 产出的 bytes、handler `post(data=signed_body)`」从实现上规避二次序列化。
+**新增风险点(均已在设计内消除并各有回归测试)**:
+
+1. **body 字节一致性**:签名 hash 的字节必须 = 实际发送字节。由 §9 测试第 4 条锁死,并通过「`sign_request` 返回同一份
+   `_sign_request` 产出的 bytes、handler `post(data=signed_body)`」从实现上规避二次序列化。
+2. **region 分叉**(对抗式 review 发现):URL host region 与 SigV4 scope region 必须一致,否则 401。由 §7 的单一
+   `_resolve_region` + §9 测试第 8 条锁死。
+3. **调用方 Authorization 覆盖 SigV4**(对抗式 review 发现):SigV4 分支签名前剥离传入 `Authorization`。由 §9 测试第 9 条锁死。
+
+**对现有其他 provider 无影响的论据不变**:by-id 子路由(delete/get/cancel/compact/list_input_items)以 `model=None` 调
+registry,Mantle gate 对 `model=None` 返回 `None`,因此 SigV4 config 根本不参与这些子路由(对抗式 review 提出的"子路由未签名"
+顾虑因此不成立)。
 
 ---
 
@@ -206,6 +225,10 @@ region 解析复用 `BaseAWSLLM._get_aws_region_name(optional_params)`(`aws_regi
 6. **双缺报错**:两种 auth 都缺失时报错,且文案同时提示 bearer 和 IAM。
 7. **共享 handler 回归(护栏)**:一个 `sign_request` 返回 `None` 的普通 responses provider,handler 仍走
    `json=data`(保护既有 OpenAI / 其他 responses provider 不被破坏)。
+8. **region 单一真源(对抗式 review 回归)**:只传 `aws_region_name`(无 region 环境变量)时,`get_complete_url` 的 URL host
+   region 与 `sign_request` 的 SigV4 scope region 一致(否则 401)。
+9. **Authorization 不被覆盖(对抗式 review 回归)**:headers 里带陈旧 `Authorization` 时,SigV4 分支最终产出的仍是
+   `AWS4-HMAC-SHA256` 头,陈旧 Bearer 不残留。
 
 ---
 
