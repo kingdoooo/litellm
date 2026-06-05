@@ -6,6 +6,7 @@ Mantle's gpt-5.5 / gpt-5.4 are served ONLY on the non-standard
 Bearer auth that make that routing work.
 """
 
+import copy
 import os
 import sys
 
@@ -304,6 +305,55 @@ class TestBedrockMantleResponsesRegistry:
             model=None,
         )
         assert cfg is None
+
+    def test_declared_responses_non_openai_routes_to_standard_path(
+        self, restore_model_cost
+    ):
+        # New feature: a non-OpenAI model declared mode=responses (e.g. via a
+        # user's proxy model_info block) must route to the STANDARD /v1/responses
+        # path, not the frontier /openai/v1/responses path. Fails before the
+        # path-aware gate exists (old gate returned None for non-gpt models).
+        from litellm.utils import ProviderConfigManager, register_model
+
+        register_model(
+            {
+                "bedrock_mantle/somelab.future-model": {
+                    "litellm_provider": "bedrock_mantle",
+                    "mode": "responses",
+                }
+            }
+        )
+        cfg = ProviderConfigManager.get_provider_responses_api_config(
+            provider="bedrock_mantle",
+            model="somelab.future-model",
+        )
+        assert isinstance(cfg, BedrockMantleResponsesAPIConfig)
+        assert cfg.use_openai_path is False
+
+
+@pytest.fixture
+def restore_model_cost():
+    """Snapshot litellm.model_cost so register_model edits don't leak across tests.
+
+    register_model mutates the global litellm.model_cost, and get_model_info is
+    lru_cached, so without restore + cache_clear a registered model would bleed
+    into sibling tests in the same process.
+
+    The snapshot MUST be a deepcopy, not a shallow dict() copy. register_model
+    overwrites an existing key via
+    `litellm.model_cost.setdefault(key, {}).update(...)`, mutating the nested
+    dict in place. A shallow copy shares those nested dicts, so restoring the
+    outer dict cannot undo an overwrite of an existing entry (e.g. gpt-oss-120b);
+    teardown would leave mode=responses and poison TestBedrockMantleResponsesPricing.
+    Verified empirically: shallow copy fails to restore, deepcopy restores to chat.
+    """
+    original_model_cost = copy.deepcopy(litellm.model_cost)
+    litellm.get_model_info.cache_clear()
+    try:
+        yield
+    finally:
+        litellm.model_cost = original_model_cost
+        litellm.get_model_info.cache_clear()
 
 
 @pytest.fixture
