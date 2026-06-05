@@ -23,9 +23,14 @@
 - `AmazonInvokeConfig.sign_request` (`litellm/llms/bedrock/chat/invoke_transformations/base_invoke_transformation.py:114`) is the reference: a thin forward to `self._sign_request(service_name="bedrock", ...)`. Mantle's override mirrors it but uses the composed signer and resolves the Mantle bearer first.
 - Existing chat/embedding signed-body pattern to mirror: `litellm/llms/custom_httpx/llm_http_handler.py` ~896-956 (`headers, signed_body = provider_config.sign_request(...)` then `if signed_body is not None: post(data=signed_body) else: post(json=data)`).
 - Registry already returns the Mantle config (`litellm/utils.py:8920`); **no routing/registry change in this plan.**
-- **Region must be a single source of truth (adversarial-review finding).** The existing `get_complete_url` resolves region from `BEDROCK_MANTLE_REGION` -> `AWS_REGION` -> default and does **not** read `litellm_params.aws_region_name` or `AWS_REGION_NAME`. But signing's `_get_aws_region_name` reads `optional_params["aws_region_name"]` -> `AWS_REGION_NAME` -> `AWS_REGION` first. So a caller passing `aws_region_name=us-east-2` with no region env gets a URL host for the *default* region but a SigV4 scope for `us-east-2` -> host/scope mismatch -> 401. The fix (Task 3a) routes both through one `_resolve_region(params)` helper and injects the resolved region into `optional_params` before signing.
+- **Region must be a single source of truth (adversarial-review finding, deepened in 2nd review).** Two distinct ways the URL host region and the SigV4 credential-scope region can diverge, both causing a 401 in the IAM-only deployment this PR targets:
+  - (a) The original `get_complete_url` resolved region from `BEDROCK_MANTLE_REGION` -> `AWS_REGION` -> default and did **not** read `aws_region_name`/`AWS_REGION_NAME`, while signing's `_get_aws_region_name` reads `aws_region_name` first.
+  - (b) **More subtle (2nd-round finding, verified by running `litellm.get_llm_provider`):** before the config runs, `litellm/responses/main.py:688-691` (`_resolve_model_provider_for_responses`) calls `get_llm_provider`, which for `bedrock_mantle` returns `dynamic_api_base = "https://bedrock-mantle.<DEFAULT-region>.api.aws/v1"` (region from `BEDROCK_MANTLE_REGION`/`AWS_REGION` only, ignoring `aws_region_name`) and writes it into `litellm_params.api_base`. So `get_complete_url` receives a **non-None** `api_base` pinned to the default region; a naive "only resolve region when api_base is None" fix is bypassed, and the URL stays default-region while signing uses `aws_region_name`. `dynamic_api_key` is correctly `None` in the IAM case, so SigV4 still fires (the bug is wrong-region signing, not auth selection).
+  - The Mythos chat route avoids both because it is routed under `custom_llm_provider="bedrock"` (never hits the `bedrock_mantle` base-injection branch) and its `get_complete_url` rebuilds the URL from `_get_aws_region_name(optional_params)`, ignoring any incoming `api_base`.
+  - The fix (Task 3a): one `_resolve_region(params)` helper (precedence: `aws_region_name` -> region embedded in an explicit Mantle `api_base` -> `BEDROCK_MANTLE_REGION`/`AWS_REGION_NAME`/`AWS_REGION` -> default); `get_complete_url` pins standard Mantle hosts to that resolved region (so the injected default-region base cannot win over `aws_region_name`) while preserving genuinely custom proxy hosts; `sign_request` injects the same resolved region into `optional_params` before signing. Verified consistent across all existing URL tests plus the injected-base and aws_region_name-only cases.
 - **Caller `Authorization` can clobber SigV4 (adversarial-review finding).** The handler does `headers.update(extra_headers)` after `validate_environment`; once `validate_environment` no longer forces a Bearer header, a caller-supplied `extra_headers["Authorization"]` lands in `headers`. `_sign_request` re-applies original `Authorization` after SigV4 signing (`base_aws_llm.py:1556-1559`, "prevent sigv4 from overwriting the auth header"), so that stale header would override the SigV4 `Authorization`. The fix (Task 3a): in the SigV4 branch (no bearer) strip any incoming `Authorization` before signing.
 - By-id responses subroutes (`delete`/`get`/`cancel`/`compact`/`list_input_items`) call `get_provider_responses_api_config` with `model=None`; the Mantle gate (`litellm/utils.py:8915-8920`) returns `None` for `model=None`, so the Mantle SigV4 config never applies to them. They are out of scope here and need no signing (verified; this is why the adversarial-review "unsigned subroutes" concern does not apply).
+- **`sign_request` belongs before the handler `try:` (2nd-round finding).** `_handle_error` (`llm_http_handler.py:5203`) wraps whatever it catches into `provider_config.get_error_class(..., status_code=500)`. If the `sign_request` call sat inside the `try:`, the both-auth-missing `ValueError` would be rewrapped as a generic 500 (the message text survives via `str(e)`, but it is no longer a clean `ValueError`). Signing performs no network I/O, so Task 2 places `sign_request` (and the fake-stream prep it depends on) before the `try:`; only the `post` calls — the real source of network/HTTP errors — stay inside it.
 
 ## File Structure
 
@@ -243,35 +248,35 @@ In `litellm/llms/custom_httpx/llm_http_handler.py`, replace the `try:` block of 
             )
 ```
 
-with:
+with (note: fake-stream prep and `sign_request` are deliberately placed **before** the `try:`. Signing does no network I/O, and a `sign_request` failure such as the both-auth-missing `ValueError` must surface to the caller as-is, not be wrapped into a provider HTTP error by `_handle_error`. Only the `post` calls stay inside the `try:`):
 
 ```python
-        try:
-            is_stream_request = bool(stream)
-            if is_stream_request and fake_stream is True:
-                stream, data = self._prepare_fake_stream_request(
-                    stream=stream,
-                    data=data,
-                    fake_stream=fake_stream,
-                )
-
-            # Sign after the body is final (post-transform/normalize/extra_body and
-            # post fake-stream prep) so signed bytes match what we send. No-op for
-            # providers that inherit the default sign_request.
-            headers, signed_body = responses_api_provider_config.sign_request(
-                headers=headers,
-                optional_params=dict(litellm_params),
-                request_data=data,
-                api_base=api_base,
-                api_key=litellm_params.api_key,
-                model=model,
+        is_stream_request = bool(stream)
+        if is_stream_request and fake_stream is True:
+            stream, data = self._prepare_fake_stream_request(
                 stream=stream,
+                data=data,
                 fake_stream=fake_stream,
             )
-            body_kwargs: Dict[str, Any] = (
-                {"data": signed_body} if signed_body is not None else {"json": data}
-            )
 
+        # Sign after the body is final (post-transform/normalize/extra_body and post
+        # fake-stream prep) so signed bytes match what we send. No-op for providers
+        # that inherit the default sign_request.
+        headers, signed_body = responses_api_provider_config.sign_request(
+            headers=headers,
+            optional_params=dict(litellm_params),
+            request_data=data,
+            api_base=api_base,
+            api_key=litellm_params.api_key,
+            model=model,
+            stream=stream,
+            fake_stream=fake_stream,
+        )
+        body_kwargs: Dict[str, Any] = (
+            {"data": signed_body} if signed_body is not None else {"json": data}
+        )
+
+        try:
             if is_stream_request:
                 response = sync_httpx_client.post(
                     url=api_base,
@@ -318,34 +323,36 @@ with:
             )
 ```
 
+Note this also moves the `logging_obj.pre_call(...)` block: it currently sits between `data` finalization and the `try:`. Keep `pre_call` after the `sign_request` block (so it logs the final signed headers) and immediately before the `try:`.
+
 - [ ] **Step 4: Edit the async handler identically**
 
 In `async_response_api_handler`, apply the same transformation to its `try:` block (~line 2476-2526). It is structurally identical to the sync block except it `await`s `async_httpx_client.post(...)` and returns `ResponsesAPIStreamingIterator` (not `SyncResponsesAPIStreamingIterator`). Replace its body with:
 
 ```python
-        try:
-            is_stream_request = bool(stream)
-            if is_stream_request and fake_stream is True:
-                stream, data = self._prepare_fake_stream_request(
-                    stream=stream,
-                    data=data,
-                    fake_stream=fake_stream,
-                )
-
-            headers, signed_body = responses_api_provider_config.sign_request(
-                headers=headers,
-                optional_params=dict(litellm_params),
-                request_data=data,
-                api_base=api_base,
-                api_key=litellm_params.api_key,
-                model=model,
+        is_stream_request = bool(stream)
+        if is_stream_request and fake_stream is True:
+            stream, data = self._prepare_fake_stream_request(
                 stream=stream,
+                data=data,
                 fake_stream=fake_stream,
             )
-            body_kwargs: Dict[str, Any] = (
-                {"data": signed_body} if signed_body is not None else {"json": data}
-            )
 
+        headers, signed_body = responses_api_provider_config.sign_request(
+            headers=headers,
+            optional_params=dict(litellm_params),
+            request_data=data,
+            api_base=api_base,
+            api_key=litellm_params.api_key,
+            model=model,
+            stream=stream,
+            fake_stream=fake_stream,
+        )
+        body_kwargs: Dict[str, Any] = (
+            {"data": signed_body} if signed_body is not None else {"json": data}
+        )
+
+        try:
             if is_stream_request:
                 response = await async_httpx_client.post(
                     url=api_base,
@@ -393,6 +400,8 @@ In `async_response_api_handler`, apply the same transformation to its `try:` blo
                 provider_config=responses_api_provider_config,
             )
 ```
+
+Same placement note as the sync handler: keep `logging_obj.pre_call(...)` after the `sign_request` block and just before the `try:`; only the `await ...post(...)` calls stay inside the `try:`.
 
 - [ ] **Step 5: Run the wiring tests + the existing responses handler tests**
 
@@ -476,9 +485,10 @@ Expected: FAIL — `BedrockMantleResponsesAPIConfig.__init__() got an unexpected
 
 - [ ] **Step 3: Implement composition + `sign_request`**
 
-Edit `litellm/llms/bedrock_mantle/responses/transformation.py`. Update imports (top of file) to add the signer, error type, and `Tuple`:
+Edit `litellm/llms/bedrock_mantle/responses/transformation.py`. Update imports (top of file) to add the signer, error type, `Tuple`, and `re` (used by the region resolver to read an embedded region out of an explicit mantle base):
 
 ```python
+import re
 from typing import Optional, Tuple
 
 from botocore.exceptions import NoCredentialsError
@@ -490,6 +500,13 @@ from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
 ```
 
+Add a module-level regex (near `_BASE_SUFFIXES_TO_STRIP`) that matches the standard Mantle host and captures its region segment:
+
+```python
+# Standard Mantle host: https://bedrock-mantle.<region>.api.aws (group 1 = region).
+_MANTLE_HOST_RE = re.compile(r"^https?://bedrock-mantle\.([^/.]+)\.api\.aws", re.IGNORECASE)
+```
+
 Add an `__init__` (just after the class line `class BedrockMantleResponsesAPIConfig(OpenAIResponsesAPIConfig):`, before the `custom_llm_provider` property) that injects the signer for testability:
 
 ```python
@@ -498,24 +515,52 @@ Add an `__init__` (just after the class line `class BedrockMantleResponsesAPICon
         self._aws_signer = aws_signer or BaseAWSLLM()
 ```
 
-Add a single region resolver so the URL host and the SigV4 credential scope can never diverge (adversarial-review fix). Place it as a static method on the class. Its precedence puts `litellm_params.aws_region_name` first (matching what the signer's `_get_aws_region_name` reads first), then the Mantle/AWS env vars, then the default:
+Add a single region resolver so the URL host and the SigV4 credential scope can never diverge (adversarial self-review fix; see the "Region single source of truth" key fact). Place it as a static method on the class. Precedence: explicit `aws_region_name` first (this is also what the signer's `_get_aws_region_name` reads first), then a region embedded in an explicit Mantle `api_base`, then the region env vars, then the default:
 
 ```python
     @staticmethod
-    def _resolve_region(litellm_params: dict) -> str:
+    def _resolve_region(params: dict) -> str:
+        region = params.get("aws_region_name")
+        if region:
+            return region
+        base = params.get("api_base") or get_secret_str("BEDROCK_MANTLE_API_BASE")
+        if base:
+            match = _MANTLE_HOST_RE.match(base.rstrip("/"))
+            if match:
+                return match.group(1)
         return (
-            litellm_params.get("aws_region_name")
-            or get_secret_str("BEDROCK_MANTLE_REGION")
+            get_secret_str("BEDROCK_MANTLE_REGION")
             or get_secret_str("AWS_REGION_NAME")
             or get_secret_str("AWS_REGION")
             or BEDROCK_MANTLE_DEFAULT_REGION
         )
 ```
 
-Replace the region line in `get_complete_url` (currently `region = (get_secret_str("BEDROCK_MANTLE_REGION") or get_secret_str("AWS_REGION") or BEDROCK_MANTLE_DEFAULT_REGION)`) with a call to the resolver, so a caller-supplied `aws_region_name` shapes the host:
+Rewrite `get_complete_url` so the URL host always derives from the single resolved region for standard Mantle hosts (closing the `dynamic_api_base` injection hole, see key fact), while genuinely custom proxy hosts are preserved. Replace the current method body with:
 
 ```python
-        region = self._resolve_region(litellm_params)
+    def get_complete_url(
+        self,
+        api_base: Optional[str],
+        litellm_params: dict,
+    ) -> str:
+        region = self._resolve_region({**litellm_params, "api_base": api_base})
+        base = (
+            api_base
+            or get_secret_str("BEDROCK_MANTLE_API_BASE")
+            or f"https://bedrock-mantle.{region}.api.aws"
+        )
+        base = base.rstrip("/")
+        for suffix in _BASE_SUFFIXES_TO_STRIP:
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        # For the standard Mantle host (including the default-region base that
+        # responses/main.py auto-injects into litellm_params.api_base), pin to the
+        # single resolved region so aws_region_name wins; preserve custom proxy hosts.
+        if _MANTLE_HOST_RE.match(base):
+            base = f"https://bedrock-mantle.{region}.api.aws"
+        return f"{base}/openai/v1/responses"
 ```
 
 Add the `sign_request` override at the end of the class (after `supports_native_websocket`). It (1) resolves the Mantle bearer chain; (2) for the SigV4 path, pins `optional_params["aws_region_name"]` to the same resolved region the URL used and strips any caller-supplied `Authorization` so the signer's "restore original Authorization" step cannot clobber the SigV4 header; (3) forwards to the shared `_sign_request`; (4) converts the unhelpful no-credentials error into a message naming both auth paths:
@@ -538,12 +583,17 @@ Add the `sign_request` override at the end of the class (after `supports_native_
             or get_secret_str("AWS_BEARER_TOKEN_BEDROCK")
         )
         if not bearer:
-            # SigV4 path. Pin the credential-scope region to the same region the URL
-            # host uses, and drop any caller Authorization so _sign_request's
-            # restore-original-Authorization step cannot override the SigV4 header.
+            # SigV4 path. Pin the credential-scope region to the region of the actual
+            # signing URL (api_base, already region-resolved by get_complete_url) so the
+            # SigV4 scope and the URL host can never disagree. Resolve from api_base first,
+            # then fall back to the regular precedence. Also drop any caller Authorization
+            # so _sign_request's restore-original-Authorization step cannot override the
+            # SigV4 header.
             optional_params = {
                 **optional_params,
-                "aws_region_name": self._resolve_region(optional_params),
+                "aws_region_name": self._resolve_region(
+                    {**optional_params, "api_base": api_base}
+                ),
             }
             headers = {
                 k: v for k, v in headers.items() if k.lower() != "authorization"
@@ -733,6 +783,57 @@ Append to class `TestBedrockMantleResponsesSigV4` in the Mantle test file:
             api_key=None,
         )
         assert "/ap-southeast-2/bedrock/aws4_request" in headers["Authorization"]
+
+    def test_injected_default_region_base_does_not_override_aws_region_name(
+        self, monkeypatch
+    ):
+        """2nd-round adversarial regression: responses/main.py auto-injects
+        litellm_params.api_base = https://bedrock-mantle.<DEFAULT>.api.aws/v1 (default
+        region, ignoring aws_region_name). The config must still pin BOTH the URL host
+        and the SigV4 scope to aws_region_name, or the IAM deployment 401s. A naive
+        'resolve region only when api_base is None' fix would fail this test.
+        """
+        monkeypatch.delenv("BEDROCK_MANTLE_REGION", raising=False)
+        monkeypatch.delenv("BEDROCK_MANTLE_API_BASE", raising=False)
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_REGION_NAME", raising=False)
+        monkeypatch.delenv("AWS_BEARER_TOKEN_BEDROCK", raising=False)
+        monkeypatch.delenv("BEDROCK_MANTLE_API_KEY", raising=False)
+
+        from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
+
+        injected_base = "https://bedrock-mantle.us-east-1.api.aws/v1"  # default region
+        params = {
+            "aws_region_name": "us-east-2",  # what the caller actually wants
+            "api_base": injected_base,
+            "aws_access_key_id": "AKIAEXAMPLE",
+            "aws_secret_access_key": "c2VjcmV0LXRlc3Qtc2VjcmV0LXRlc3Qtc2VjcmV0",
+        }
+        cfg = BedrockMantleResponsesAPIConfig(aws_signer=BaseAWSLLM())
+        url = cfg.get_complete_url(api_base=injected_base, litellm_params=params)
+        assert url == "https://bedrock-mantle.us-east-2.api.aws/openai/v1/responses"
+
+        headers, _ = cfg.sign_request(
+            headers={},
+            optional_params=params,
+            request_data={"input": "hi"},
+            api_base=url,
+            api_key=None,
+        )
+        assert "/us-east-2/bedrock/aws4_request" in headers["Authorization"]
+        assert "us-east-1" not in headers["Authorization"]
+
+    def test_custom_proxy_host_is_preserved(self, monkeypatch):
+        """A genuinely custom (non-Mantle) api_base host must be preserved, not rewritten
+        to a bedrock-mantle host. Only standard Mantle hosts are region-pinned.
+        """
+        monkeypatch.delenv("BEDROCK_MANTLE_API_BASE", raising=False)
+        cfg = BedrockMantleResponsesAPIConfig()
+        url = cfg.get_complete_url(
+            api_base="https://mantle-proxy.internal.example/openai/v1",
+            litellm_params={"aws_region_name": "us-east-2"},
+        )
+        assert url == "https://mantle-proxy.internal.example/openai/v1/responses"
 
     def test_caller_authorization_does_not_override_sigv4(self, monkeypatch):
         """Adversarial-review regression: a caller-supplied Authorization header (e.g.
@@ -997,15 +1098,22 @@ Base = `litellm_oss_staging_040626` (not `main`, not `litellm_internal_staging`;
 | §9.5 region + URL unchanged | Task 3b + existing URL tests (unchanged) |
 | §9.6 both-missing error names both paths | Task 3c `test_no_bearer_and_no_credentials_raises_both_paths` |
 | §9.7 handler regression: no-op stays json | Task 2 `test_responses_handler_sends_json_when_not_signed` |
-| Region single-source-of-truth (adversarial-review fix): URL host region == SigV4 scope region | Task 3a `_resolve_region` + `get_complete_url` change; Task 3b `test_url_region_and_sigv4_region_agree_from_litellm_params` |
-| Caller `Authorization` cannot clobber SigV4 (adversarial-review fix) | Task 3a SigV4-branch strip; Task 3b `test_caller_authorization_does_not_override_sigv4` |
+| Region single-source-of-truth (URL host region == SigV4 scope region) | Task 3a `_resolve_region` + `get_complete_url` rewrite; Task 3b `test_url_region_and_sigv4_region_agree_from_litellm_params` |
+| Region: injected default-region `api_base` cannot override `aws_region_name` (2nd-round) | Task 3a `_MANTLE_HOST_RE` pin in `get_complete_url`; Task 3b `test_injected_default_region_base_does_not_override_aws_region_name` |
+| Region: custom proxy host preserved | Task 3b `test_custom_proxy_host_is_preserved` |
+| Caller `Authorization` cannot clobber SigV4 | Task 3a SigV4-branch strip; Task 3b `test_caller_authorization_does_not_override_sigv4` |
+| both-auth `ValueError` surfaces cleanly, not wrapped as 500 (2nd-round) | Task 2 `sign_request` placed before the handler `try:` |
 | §8 no impact on other providers | Task 5 Step 2 |
 | §10 live Proof of Fix | Task 6 Step 2 |
 | §11 branch/PR/base/secrets | Task 6 Step 3 |
 
 No gaps.
 
-**Adversarial-review disposition (Codex):** Two findings were real and are now fixed above — region divergence between `get_complete_url` and signing (3a `_resolve_region`), and caller `Authorization` overriding the SigV4 header (3a SigV4-branch strip). Two were hygiene improvements applied — fake AWS keys now use the repo's `AKIAEXAMPLE`/`ASIAEXAMPLE` convention, and Task 5 stages explicit paths instead of `git add -A`. The remaining findings did not apply: the "79-commit/372-file" target inconsistency and "code still Bearer-only" were artifacts of the reviewer diffing against `litellm_internal_staging` (the actual branch delta is the docs, and we are reviewing a plan, not merged code); the "unsigned by-id subroutes" concern does not hold because `delete`/`get`/`cancel`/`compact`/`list_input_items` call the registry with `model=None`, which returns `None` for Mantle so the SigV4 config never applies to them; and the local-hook/`--no-verify`/secret-scan-on-commit concerns do not apply because the repo has no local git hooks (secret scanning is CI-only via ggshield, and `test_no_hardcoded_secrets.py` only matches `Basic <base64>` strings, not AWS keys).
+**Adversarial-review disposition.**
+
+First round (Codex): two real findings, fixed — region divergence between `get_complete_url` and signing (`_resolve_region`), and caller `Authorization` overriding the SigV4 header (SigV4-branch strip). Two hygiene items applied — fake AWS keys use the repo `AKIAEXAMPLE`/`ASIAEXAMPLE` convention; Task 5 stages explicit paths instead of `git add -A`. Non-applicable findings: the "79-commit/372-file" target inconsistency and "code still Bearer-only" were artifacts of the reviewer diffing against `litellm_internal_staging` (actual branch delta is the docs, and this reviews a plan, not merged code); "unsigned by-id subroutes" does not hold because those routes call the registry with `model=None`, which returns `None` for Mantle; the local-hook/`--no-verify`/secret-scan-on-commit concerns do not apply (no local git hooks; secret scan is CI-only via ggshield, and `test_no_hardcoded_secrets.py` only matches `Basic <base64>` strings).
+
+Second round (self-review, after Codex runtime kept failing on its own upstream Mantle endpoint): two further real findings, fixed. (1) **Deeper region hole, verified by running `litellm.get_llm_provider`:** `responses/main.py:688-691` injects a default-region `dynamic_api_base` into `litellm_params.api_base` before the config runs, which defeated the first-round `_resolve_region` fix (it only resolved region when `api_base` was None). `get_complete_url` now pins standard Mantle hosts to the single resolved region regardless of an incoming base, validated green against every existing URL test plus the injected-base and aws_region_name-only cases. (2) **Error wrapping:** the both-auth-missing `ValueError` would have been rewrapped as a 500 by `_handle_error` had `sign_request` stayed inside the handler `try:`; it now runs before the `try:`.
 
 **2. Placeholder scan:** No TBD/TODO/"handle edge cases"/"similar to". Every code step shows full code; every test step shows full test bodies.
 

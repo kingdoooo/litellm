@@ -165,13 +165,24 @@ def sign_request(self, headers, optional_params, request_data, api_base,
 3. 都拿不到 → `_sign_request` 内 `get_credentials` 报错;Mantle config 负责把错误文案更新为**同时提示 bearer 和 IAM
    两条路**。
 
-**region 必须单一真源(对抗式 review 修正)。** 原先以为 `get_complete_url` 与签名的 region 来源"天然一致",核验后发现并不一致:
-`get_complete_url` 读 `BEDROCK_MANTLE_REGION` → `AWS_REGION` → 默认,**不读** `litellm_params.aws_region_name` /
-`AWS_REGION_NAME`;而签名侧 `_get_aws_region_name` 优先读 `optional_params["aws_region_name"]` → `AWS_REGION_NAME` →
-`AWS_REGION`。调用方只传 `aws_region_name`(无 region 环境变量)时,URL host 用默认 region、SigV4 scope 用 `aws_region_name`
-→ host 与签名 scope 不一致 → 401。修正:引入单一 `_resolve_region(params)`(优先级 `aws_region_name` →
-`BEDROCK_MANTLE_REGION` → `AWS_REGION_NAME` → `AWS_REGION` → 默认),`get_complete_url` 用它决定 host;`sign_request`
-在 SigV4 分支把同一个 resolved region 注入 `optional_params["aws_region_name"]` 再签名,两侧 region 永不分叉。
+**region 必须单一真源(对抗式 review 修正,二轮加深)。** URL host region 与 SigV4 scope region 有两条会分叉的路径,都会在目标 IAM 部署下 401:
+
+(a) 一轮发现:原 `get_complete_url` 读 `BEDROCK_MANTLE_REGION` → `AWS_REGION` → 默认,**不读** `aws_region_name` /
+`AWS_REGION_NAME`;而签名侧 `_get_aws_region_name` 优先读 `aws_region_name`。只传 `aws_region_name`(无 region 环境变量)时两侧分叉。
+
+(b) 二轮发现(实跑 `litellm.get_llm_provider` 确认,更隐蔽):config 运行前,`litellm/responses/main.py:688-691`
+(`_resolve_model_provider_for_responses`)对 `bedrock_mantle` 拿到 `dynamic_api_base =
+https://bedrock-mantle.{默认region}.api.aws/v1`(region 只看 `BEDROCK_MANTLE_REGION`/`AWS_REGION`,忽略 `aws_region_name`)
+并写回 `litellm_params.api_base`。于是 `get_complete_url` 收到的是**非 None**、且 pin 在默认 region 的 api_base;"仅当 api_base 为
+None 才解析 region"这种天真修法会被绕过,URL 停在默认 region 而签名用 `aws_region_name`。(`dynamic_api_key` 在 IAM 场景正确为
+None,SigV4 仍会触发,坏的是签错 region 而非认证选择。)Mythos chat 路由不踩这两个坑,因为它走 `custom_llm_provider="bedrock"`
+不进 `bedrock_mantle` 注入分支,且其 `get_complete_url` 无视传入 api_base、用 `_get_aws_region_name` 重建 URL。
+
+修正:单一 `_resolve_region(params)`(优先级 `aws_region_name` → 显式 Mantle api_base 内嵌的 region →
+`BEDROCK_MANTLE_REGION`/`AWS_REGION_NAME`/`AWS_REGION` → 默认);`get_complete_url` 对标准 Mantle host **一律按 resolved
+region 重建**(注入的默认-region base 因此压不过 `aws_region_name`),对真正自定义的 proxy host 则原样保留;`sign_request`
+在 SigV4 分支把同一 resolved region 注入 `optional_params["aws_region_name"]` 再签名。已对全部既有 URL 测试 + 注入 base /
+仅 aws_region_name 两个场景实跑验证一致。
 
 **调用方 `Authorization` 不得覆盖 SigV4(对抗式 review 修正)。** handler 在 `validate_environment` 后执行
 `headers.update(extra_headers)`;`validate_environment` 放松后,调用方塞进 `extra_headers["Authorization"]` 会进入
@@ -198,9 +209,12 @@ def sign_request(self, headers, optional_params, request_data, api_base,
 
 1. **body 字节一致性**:签名 hash 的字节必须 = 实际发送字节。由 §9 测试第 4 条锁死,并通过「`sign_request` 返回同一份
    `_sign_request` 产出的 bytes、handler `post(data=signed_body)`」从实现上规避二次序列化。
-2. **region 分叉**(对抗式 review 发现):URL host region 与 SigV4 scope region 必须一致,否则 401。由 §7 的单一
-   `_resolve_region` + §9 测试第 8 条锁死。
+2. **region 分叉**(对抗式 review 发现,二轮加深):URL host region 与 SigV4 scope region 必须一致,否则 401;尤其要防住
+   `responses/main.py` 注入的默认-region `api_base` 压过 `aws_region_name`。由 §7 的单一 `_resolve_region` + 标准 Mantle host
+   按 resolved region 重建 + §9 测试第 8/10 条锁死。
 3. **调用方 Authorization 覆盖 SigV4**(对抗式 review 发现):SigV4 分支签名前剥离传入 `Authorization`。由 §9 测试第 9 条锁死。
+4. **报错被包成 500**(二轮发现):both-auth-missing 的 `ValueError` 若在 handler `try:` 内会被 `_handle_error` 包成 500。
+   `sign_request` 因此放在 handler `try:` **之前**(签名无网络 I/O),让该 `ValueError` 干净抛出;只有 `post` 留在 `try:` 内。
 
 **对现有其他 provider 无影响的论据不变**:by-id 子路由(delete/get/cancel/compact/list_input_items)以 `model=None` 调
 registry,Mantle gate 对 `model=None` 返回 `None`,因此 SigV4 config 根本不参与这些子路由(对抗式 review 提出的"子路由未签名"
@@ -229,6 +243,10 @@ registry,Mantle gate 对 `model=None` 返回 `None`,因此 SigV4 config 根本�
    region 与 `sign_request` 的 SigV4 scope region 一致(否则 401)。
 9. **Authorization 不被覆盖(对抗式 review 回归)**:headers 里带陈旧 `Authorization` 时,SigV4 分支最终产出的仍是
    `AWS4-HMAC-SHA256` 头,陈旧 Bearer 不残留。
+10. **注入默认-region base 不压过 aws_region_name(二轮回归,关键)**:模拟 `responses/main.py` 注入的
+    `https://bedrock-mantle.{默认}.api.aws/v1` 作为 `api_base` + 用户 `aws_region_name=us-east-2`,断言 URL host 与 SigV4 scope
+    都为 `us-east-2`,且不含默认 region。"仅当 api_base 为 None 才解析 region"的天真修法会让这条失败。
+11. **自定义 proxy host 保留**:非 Mantle 的 `api_base` host 不被改写成 bedrock-mantle host(只有标准 Mantle host 才按 region 重建)。
 
 ---
 
