@@ -231,6 +231,7 @@ class TestBedrockMantleResponsesRegistry:
             model="openai.gpt-5.5",
         )
         assert isinstance(cfg, BedrockMantleResponsesAPIConfig)
+        assert cfg.use_openai_path is True
 
     def test_registry_returns_config_for_gpt_5_4_enum(self):
         from litellm.utils import ProviderConfigManager
@@ -240,6 +241,7 @@ class TestBedrockMantleResponsesRegistry:
             model="openai.gpt-5.4",
         )
         assert isinstance(cfg, BedrockMantleResponsesAPIConfig)
+        assert cfg.use_openai_path is True
 
     def test_registry_returns_none_for_gpt_oss(self):
         # Regression guard: gpt-oss must NOT get the native Responses config; it
@@ -272,6 +274,7 @@ class TestBedrockMantleResponsesRegistry:
             model="openai.gpt-6",
         )
         assert isinstance(cfg, BedrockMantleResponsesAPIConfig)
+        assert cfg.use_openai_path is True
 
     @pytest.mark.parametrize(
         "model",
@@ -330,6 +333,72 @@ class TestBedrockMantleResponsesRegistry:
         assert isinstance(cfg, BedrockMantleResponsesAPIConfig)
         assert cfg.use_openai_path is False
 
+    def test_gpt_oss_opt_in_routes_to_standard_path(self, restore_model_cost):
+        # When a user opts gpt-oss into native Responses via model_info mode,
+        # it must take the STANDARD /v1/responses path (gpt-oss Responses is on
+        # /v1/responses, NOT the frontier /openai/v1/responses path).
+        from litellm.utils import ProviderConfigManager, register_model
+
+        register_model(
+            {
+                "bedrock_mantle/openai.gpt-oss-120b": {
+                    "litellm_provider": "bedrock_mantle",
+                    "mode": "responses",
+                }
+            }
+        )
+        cfg = ProviderConfigManager.get_provider_responses_api_config(
+            provider="bedrock_mantle",
+            model="openai.gpt-oss-120b",
+        )
+        assert isinstance(cfg, BedrockMantleResponsesAPIConfig)
+        assert cfg.use_openai_path is False
+
+    def test_unmapped_model_degrades_to_none_without_crashing(self, restore_model_cost):
+        # A non-frontier model that is not in model_cost makes get_model_info
+        # raise; the gate must swallow it and return None rather than crash.
+        from litellm.utils import ProviderConfigManager
+
+        litellm.model_cost.pop("bedrock_mantle/somelab.unmapped-model", None)
+        litellm.get_model_info.cache_clear()
+        cfg = ProviderConfigManager.get_provider_responses_api_config(
+            provider="bedrock_mantle",
+            model="somelab.unmapped-model",
+        )
+        assert cfg is None
+
+    def test_register_model_restore_undoes_existing_key_overwrite(self):
+        # Self-contained guard for the deepcopy requirement of restore_model_cost.
+        # register_model overwrites an existing key by mutating its nested dict in
+        # place, so the snapshot must be a deepcopy: a shallow dict() copy would
+        # share that nested dict and leave mode=responses after restore, making
+        # the final assertion fail. The in-place clear+update mirrors the fixture.
+        from litellm.utils import ProviderConfigManager, register_model
+
+        snapshot = copy.deepcopy(litellm.model_cost)
+        litellm.get_model_info.cache_clear()
+        try:
+            register_model(
+                {
+                    "bedrock_mantle/openai.gpt-oss-120b": {
+                        "litellm_provider": "bedrock_mantle",
+                        "mode": "responses",
+                    }
+                }
+            )
+            during = ProviderConfigManager.get_provider_responses_api_config(
+                provider="bedrock_mantle", model="openai.gpt-oss-120b"
+            )
+            assert isinstance(during, BedrockMantleResponsesAPIConfig)
+        finally:
+            litellm.model_cost.clear()
+            litellm.model_cost.update(snapshot)
+            litellm.get_model_info.cache_clear()
+        after = ProviderConfigManager.get_provider_responses_api_config(
+            provider="bedrock_mantle", model="openai.gpt-oss-120b"
+        )
+        assert after is None
+
 
 @pytest.fixture
 def restore_model_cost():
@@ -339,20 +408,28 @@ def restore_model_cost():
     lru_cached, so without restore + cache_clear a registered model would bleed
     into sibling tests in the same process.
 
-    The snapshot MUST be a deepcopy, not a shallow dict() copy. register_model
-    overwrites an existing key via
-    `litellm.model_cost.setdefault(key, {}).update(...)`, mutating the nested
-    dict in place. A shallow copy shares those nested dicts, so restoring the
-    outer dict cannot undo an overwrite of an existing entry (e.g. gpt-oss-120b);
-    teardown would leave mode=responses and poison TestBedrockMantleResponsesPricing.
-    Verified empirically: shallow copy fails to restore, deepcopy restores to chat.
+    Two subtleties make this fixture non-obvious:
+
+    1. The snapshot must be a deepcopy. register_model overwrites an existing key
+       via `litellm.model_cost.setdefault(key, {}).update(...)`, mutating the
+       nested dict in place; a shallow copy would share those nested dicts and
+       could not capture the pre-mutation values of an existing entry.
+    2. The restore must be in place (clear + update the SAME dict object), not a
+       reassignment. The conftest autouse `isolate_litellm_state` fixture
+       snapshots `litellm.model_cost` by reference and restores that reference on
+       its teardown, which runs after this one. Reassigning `litellm.model_cost`
+       to a fresh dict here is undone when conftest reinstalls its (in-place
+       mutated) reference, so the registered mode would leak and poison
+       TestBedrockMantleResponsesPricing. Mutating the original object in place
+       restores the contents conftest's reference points at.
     """
     original_model_cost = copy.deepcopy(litellm.model_cost)
     litellm.get_model_info.cache_clear()
     try:
         yield
     finally:
-        litellm.model_cost = original_model_cost
+        litellm.model_cost.clear()
+        litellm.model_cost.update(original_model_cost)
         litellm.get_model_info.cache_clear()
 
 
