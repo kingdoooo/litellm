@@ -31,6 +31,10 @@ _BASE_SUFFIXES_TO_STRIP = (
 
 
 class BedrockMantleResponsesAPIConfig(OpenAIResponsesAPIConfig):
+    def __init__(self, use_openai_path: bool = True):
+        super().__init__()
+        self.use_openai_path = use_openai_path
+
     @property
     def custom_llm_provider(self) -> LlmProviders:
         return LlmProviders.BEDROCK_MANTLE
@@ -55,7 +59,8 @@ class BedrockMantleResponsesAPIConfig(OpenAIResponsesAPIConfig):
             if base.endswith(suffix):
                 base = base[: -len(suffix)]
                 break
-        return f"{base}/openai/v1/responses"
+        path = "/openai/v1/responses" if self.use_openai_path else "/v1/responses"
+        return f"{base}{path}"
 
     def validate_environment(
         self, headers: dict, model: str, litellm_params: Optional[GenericLiteLLMParams]

@@ -84,6 +84,42 @@ class TestBedrockMantleResponsesURL:
         url = cfg.get_complete_url(api_base=None, litellm_params={})
         assert url == "https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses"
 
+    def test_standard_path_uses_region_from_env(self, monkeypatch):
+        monkeypatch.setenv("BEDROCK_MANTLE_REGION", "us-east-2")
+        monkeypatch.delenv("BEDROCK_MANTLE_API_BASE", raising=False)
+        cfg = BedrockMantleResponsesAPIConfig(use_openai_path=False)
+        url = cfg.get_complete_url(api_base=None, litellm_params={})
+        assert url == "https://bedrock-mantle.us-east-2.api.aws/v1/responses"
+        assert "/openai/v1/responses" not in url
+
+    def test_standard_path_normalizes_v1_base(self, monkeypatch):
+        monkeypatch.delenv("BEDROCK_MANTLE_API_BASE", raising=False)
+        cfg = BedrockMantleResponsesAPIConfig(use_openai_path=False)
+        url = cfg.get_complete_url(
+            api_base="https://bedrock-mantle.us-east-2.api.aws/v1",
+            litellm_params={},
+        )
+        assert url == "https://bedrock-mantle.us-east-2.api.aws/v1/responses"
+        assert url.count("/responses") == 1
+        assert "/v1/v1/responses" not in url
+
+    def test_standard_path_full_endpoint_base_not_doubled(self, monkeypatch):
+        monkeypatch.delenv("BEDROCK_MANTLE_API_BASE", raising=False)
+        cfg = BedrockMantleResponsesAPIConfig(use_openai_path=False)
+        url = cfg.get_complete_url(
+            api_base="https://bedrock-mantle.us-east-2.api.aws/v1/responses",
+            litellm_params={},
+        )
+        assert url == "https://bedrock-mantle.us-east-2.api.aws/v1/responses"
+        assert url.count("/responses") == 1
+
+    def test_default_construction_keeps_openai_path(self, monkeypatch):
+        monkeypatch.setenv("BEDROCK_MANTLE_REGION", "us-east-2")
+        monkeypatch.delenv("BEDROCK_MANTLE_API_BASE", raising=False)
+        cfg = BedrockMantleResponsesAPIConfig()
+        url = cfg.get_complete_url(api_base=None, litellm_params={})
+        assert url == "https://bedrock-mantle.us-east-2.api.aws/openai/v1/responses"
+
 
 class TestBedrockMantleResponsesAuth:
     def test_config_api_key_takes_priority(self, monkeypatch):
