@@ -118,6 +118,17 @@ elif litellm.LlmProviders.BEDROCK_MANTLE == provider:
   返回 None 走仿真; 用户显式 `model_info: {mode: responses}` (经 register_model
   写入全局 model_cost) 后才被抓到, 走 `/v1/responses`。
 
+路由信号选型 (mode vs supported_endpoints, 显式记录这个取舍):
+price-map 里 gpt-5.x 同时带 `mode: responses` 和 `supported_endpoints:
+["/v1/responses"]`, 而 gpt-oss 两者都没有 (它是 `mode: chat`)。本设计用 `mode ==
+"responses"` 作为路由信号, 不用 `supported_endpoints`。原因: `mode` 表达的是
+"这个模型只做 Responses", 与 chat-only 模型 (`mode: chat`) 形成干净的二分,
+使得 gpt-oss 这种 chat+responses 双协议模型在默认 `mode: chat` 下不会被自动
+路由, 必须显式 opt-in (符合目标 3)。若改用 `supported_endpoints` 作信号,
+任何 advertise responses 的双协议模型都会被自动路由, 默认行为会变, 且 opt-in
+语义消失。后续维护者若想切换信号, 必须意识到这会改变默认路由行为, 不是等价
+重构。
+
 路由对照:
 
 | 模型 | 命中分支 | 返回 | 上游路径 |
@@ -204,11 +215,32 @@ None, 不命中此 config。用测试锁定。
 10. `use_openai_path=False` 实例: `validate_environment` 仍 Bearer,
     `supports_native_file_search()` / `supports_native_websocket()` 仍 False。
 
-### 测试隔离
+### D. 出站请求体 (标准路径上 model 正确)
 
-涉及 `register_model` 的用例一律走 fixture, teardown 还原
-`litellm.model_cost` 并 `litellm.get_model_info.cache_clear()` (get_model_info
-有 lru_cache, 不清会跨测试串)。参照现有 `local_cost_map` fixture 的 teardown。
+11. `use_openai_path=False` 实例的 `transform_responses_api_request(model=
+    "openai.gpt-oss-120b", ...)` -> 返回的 body `model == "openai.gpt-oss-120b"`
+    且含 `input`。锁定"URL 对了" 和 "请求体也对了" 之间的缺口: 出站打到
+    `/v1/responses` 的请求体必须带裸 model。transform 是继承且路径无关的, 这条
+    在 CI 里防止未来对 transform 的回归 (实测已确认默认 config 返回裸 model +
+    input)。
+
+### 测试隔离 (snapshot 必须 deepcopy)
+
+涉及 `register_model` 的用例一律走 fixture, teardown 还原 `litellm.model_cost`
+并 `litellm.get_model_info.cache_clear()` (get_model_info 有 lru_cache, 不清会
+跨测试串)。
+
+关键: snapshot 必须 `copy.deepcopy(litellm.model_cost)`, **不能** 用浅拷贝
+`dict(litellm.model_cost)`。原因经实测确认: `register_model` 对已存在的 key 走
+`litellm.model_cost.setdefault(key, {}).update(...)`, 即原地改嵌套 dict; 浅拷贝
+共享这些嵌套 dict 对象, teardown 无法撤销对已存在条目 (如 gpt-oss-120b) 的
+覆盖 -> 实测 teardown 后 gpt-oss mode 仍是 responses, 会污染同文件的
+`TestBedrockMantleResponsesPricing`。deepcopy 实测可正确还原 (回到 chat)。
+
+现有 `local_cost_map` fixture 用浅拷贝没事, 是因为它整体重新赋值
+`litellm.model_cost = get_model_cost_map(...)`, 从不原地改已存在条目; 新 fixture
+要原地改, 所以不能照搬那个捷径。需额外加一条断言型测试: opt-in 用例 teardown
+后, 同 model 的 gate 结果回到 None (锁定不泄漏)。
 
 ## 验收 (Proof of Fix: 真实 proxy + curl)
 

@@ -36,7 +36,7 @@ Current gate branch lives at `litellm/utils.py:8912-8922`. Current config `get_c
 
 - **Modify** `litellm/llms/bedrock_mantle/responses/transformation.py` — add `__init__(self, use_openai_path: bool = True)` and make `get_complete_url` pick the trailing path from `self.use_openai_path`. (Task 1, 2)
 - **Modify** `litellm/utils.py` — rewrite the BEDROCK_MANTLE branch in `_get_python_responses_api_config` to the three-branch path-aware gate. (Task 3)
-- **Modify** `tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py` — extend existing `TestBedrockMantleResponsesURL` and `TestBedrockMantleResponsesRegistry` classes; reuse the existing `local_cost_map` fixture pattern for register_model isolation. (Tasks 1-4)
+- **Modify** `tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py` — extend existing `TestBedrockMantleResponsesURL`, `TestBedrockMantleResponsesAuth`, and `TestBedrockMantleResponsesRegistry` classes; add a `TestBedrockMantleResponsesRequestBody` class; add a `restore_model_cost` fixture (deepcopy snapshot, distinct from the shallow `local_cost_map` fixture which only works because it reassigns the whole map). (Tasks 1-4)
 
 No new files. No new instantiation sites beyond the one at `utils.py:8920` (the only place the class is constructed). The constructor param defaults to `True`, so existing call sites and the lazy-import surface (`litellm/__init__.py:1743`, `litellm/_lazy_imports_registry.py`) are unaffected.
 
@@ -151,14 +151,14 @@ git commit -m "feat(bedrock_mantle): path-aware Responses URL via use_openai_pat
 
 ---
 
-### Task 2: Shared behavior holds on the standard path (auth + capability opt-outs)
+### Task 2: Shared behavior + outbound request body hold on the standard path
 
 **Files:**
-- Test: `tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py` (extend `TestBedrockMantleResponsesAuth`)
+- Test: `tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py` (extend `TestBedrockMantleResponsesAuth`; add a new `TestBedrockMantleResponsesRequestBody` class)
 
-This task adds no production code; it locks that the `use_openai_path=False` instance shares the same Bearer auth and native-feature opt-outs as the default instance, so a future refactor cannot silently diverge the two paths.
+This task adds no production code. It locks two things for the `use_openai_path=False` instance: (a) it shares the same Bearer auth and native-feature opt-outs as the default instance, so a future refactor cannot silently diverge the two paths; (b) the outbound request body carries the bare model id. (b) closes the gap between "the URL is `/v1/responses`" (Task 1) and "the request sent to that URL is correct" — the whole point of the feature is the right model reaching the right path.
 
-- [ ] **Step 1: Write the tests**
+- [ ] **Step 1: Write the shared-behavior tests**
 
 Add inside the existing `class TestBedrockMantleResponsesAuth:`:
 
@@ -180,16 +180,39 @@ Add inside the existing `class TestBedrockMantleResponsesAuth:`:
         assert cfg.supports_native_websocket() is False
 ```
 
-- [ ] **Step 2: Run the tests**
+- [ ] **Step 2: Write the outbound-body test**
 
-Run: `python3 -m pytest "tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py::TestBedrockMantleResponsesAuth" -v`
-Expected: PASS (these behaviors are inherited and unchanged; the tests confirm the flag does not affect them).
+Add a new class to the test file (after `TestBedrockMantleResponsesAuth`). `GenericLiteLLMParams` is already imported at the top of the file (used by the auth tests):
 
-- [ ] **Step 3: Commit**
+```python
+class TestBedrockMantleResponsesRequestBody:
+    def test_standard_path_outbound_body_carries_bare_model(self):
+        # The whole feature is "the right model reaches /v1/responses". The URL
+        # tests prove the path; this proves the request body sent to it has the
+        # bare model id and the input. transform is inherited and path-agnostic,
+        # so this also guards against a future regression in transform.
+        cfg = BedrockMantleResponsesAPIConfig(use_openai_path=False)
+        body = cfg.transform_responses_api_request(
+            model="openai.gpt-oss-120b",
+            input="hello",
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+        assert body["model"] == "openai.gpt-oss-120b"
+        assert "input" in body
+```
+
+- [ ] **Step 3: Run the tests**
+
+Run: `python3 -m pytest "tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py::TestBedrockMantleResponsesAuth" "tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py::TestBedrockMantleResponsesRequestBody" -v`
+Expected: PASS (these behaviors are inherited and unchanged; the tests confirm the flag affects only the URL, not auth/features/body). Verified empirically that the default config already returns `model="openai.gpt-oss-120b"` with an `input` field, so this passes once `use_openai_path` exists from Task 1.
+
+- [ ] **Step 4: Commit**
 
 ```bash
 git add tests/test_litellm/llms/bedrock_mantle/test_bedrock_mantle_responses_transformation.py
-git commit -m "test(bedrock_mantle): lock shared auth/feature opt-out on standard responses path"
+git commit -m "test(bedrock_mantle): lock shared auth/feature/body invariants on standard responses path"
 ```
 
 ---
@@ -204,6 +227,8 @@ git commit -m "test(bedrock_mantle): lock shared auth/feature opt-out on standar
 
 Add a register_model isolation fixture and the core test to the test file. Put the fixture at module level near the existing `local_cost_map` fixture, and the test inside `class TestBedrockMantleResponsesRegistry:`.
 
+Add `import copy` to the test file's imports if it is not already present (it is needed for the deepcopy snapshot below).
+
 ```python
 @pytest.fixture
 def restore_model_cost():
@@ -212,8 +237,16 @@ def restore_model_cost():
     register_model mutates the global litellm.model_cost, and get_model_info is
     lru_cached, so without restore + cache_clear a registered model would bleed
     into sibling tests in the same process.
+
+    The snapshot MUST be a deepcopy, not a shallow dict() copy. register_model
+    overwrites an existing key via
+    `litellm.model_cost.setdefault(key, {}).update(...)`, mutating the nested
+    dict in place. A shallow copy shares those nested dicts, so restoring the
+    outer dict cannot undo an overwrite of an existing entry (e.g. gpt-oss-120b);
+    teardown would leave mode=responses and poison TestBedrockMantleResponsesPricing.
+    Verified empirically: shallow copy fails to restore, deepcopy restores to chat.
     """
-    original_model_cost = dict(litellm.model_cost)
+    original_model_cost = copy.deepcopy(litellm.model_cost)
     litellm.get_model_info.cache_clear()
     try:
         yield
@@ -392,6 +425,43 @@ Add these methods to `class TestBedrockMantleResponsesRegistry`:
         assert cfg is None
 ```
 
+- [ ] **Step 2b: Add the fixture-isolation guard test**
+
+This test directly catches a shallow-copy regression in `restore_model_cost`: it opts gpt-oss in inside a nested fixture-style block, then asserts the gate returns None again once the snapshot is restored. With a shallow `dict()` snapshot this assertion fails (the in-place `setdefault().update()` leaks); with the deepcopy snapshot it passes. Add to `class TestBedrockMantleResponsesRegistry`:
+
+```python
+    def test_opt_in_does_not_leak_after_restore(self):
+        # Guards the restore_model_cost fixture: a deepcopy snapshot must fully
+        # undo a register_model overwrite of an existing key. With a shallow copy
+        # this fails because register_model mutates the nested dict in place.
+        import copy
+
+        from litellm.utils import ProviderConfigManager, register_model
+
+        snapshot = copy.deepcopy(litellm.model_cost)
+        litellm.get_model_info.cache_clear()
+        try:
+            register_model(
+                {
+                    "bedrock_mantle/openai.gpt-oss-120b": {
+                        "litellm_provider": "bedrock_mantle",
+                        "mode": "responses",
+                    }
+                }
+            )
+            during = ProviderConfigManager.get_provider_responses_api_config(
+                provider="bedrock_mantle", model="openai.gpt-oss-120b"
+            )
+            assert isinstance(during, BedrockMantleResponsesAPIConfig)
+        finally:
+            litellm.model_cost = snapshot
+            litellm.get_model_info.cache_clear()
+        after = ProviderConfigManager.get_provider_responses_api_config(
+            provider="bedrock_mantle", model="openai.gpt-oss-120b"
+        )
+        assert after is None
+```
+
 The pre-existing `test_registry_returns_none_for_non_openai_models` (parametrized over nvidia/mistral/google/zai) and `test_registry_returns_none_when_model_is_none` already cover the non-OpenAI-default-None and model=None cases, so no new test is needed for those.
 
 - [ ] **Step 3: Run the full registry + URL + auth test classes**
@@ -464,6 +534,7 @@ Not a plan step; this is the proof-of-fix the PR description will carry. Real pr
 
 ## Self-review notes
 
-- **Spec coverage:** gate three-branch (Task 3) ✓; config flag + standard-path URL (Task 1) ✓; default unchanged / gpt-5.x regression (Task 1 default test + Task 4 flag assertions) ✓; non-OpenAI default None (pre-existing parametrized test, noted in Task 4) ✓; declared-responses core (Task 3) ✓; gpt-oss opt-in (Task 4) ✓; graceful fallback on unmapped (Task 4) ✓; model=None (pre-existing test, noted in Task 4) ✓; shared auth/feature opt-out on standard path (Task 2) ✓; test isolation via restore fixture + cache_clear (Task 3 fixture, used in Tasks 3-4) ✓; format/lint (Task 5) ✓; proof-of-fix runbook (manual section) ✓.
+- **Spec coverage:** gate three-branch (Task 3) ✓; config flag + standard-path URL (Task 1) ✓; default unchanged / gpt-5.x regression (Task 1 default test + Task 4 flag assertions) ✓; non-OpenAI default None (pre-existing parametrized test, noted in Task 4) ✓; declared-responses core (Task 3) ✓; gpt-oss opt-in (Task 4) ✓; graceful fallback on unmapped (Task 4) ✓; model=None (pre-existing test, noted in Task 4) ✓; shared auth/feature opt-out on standard path (Task 2) ✓; outbound-body carries bare model on standard path / F5 (Task 2 `TestBedrockMantleResponsesRequestBody`) ✓; test isolation via deepcopy restore fixture + cache_clear / F1 (Task 3 fixture + Task 4 no-leak guard test) ✓; format/lint (Task 5) ✓; proof-of-fix runbook (manual section) ✓.
+- **Adversarial-review fixes folded in:** F1 (fixture must deepcopy, not shallow dict — register_model mutates nested dicts in place; verified empirically) addressed in the Task 3 fixture and the Task 4 `test_opt_in_does_not_leak_after_restore` guard. F2 (mode vs supported_endpoints routing-signal tradeoff) documented in the spec. F5 (outbound-body test) added as Task 2 `TestBedrockMantleResponsesRequestBody`. F3/F4 (demand justification and the opt-in footgun) are PR-description decisions, not code changes.
 - **Placeholder scan:** no TBD/TODO; every code step shows full code; every run step shows exact command + expected outcome.
-- **Type/name consistency:** `use_openai_path` flag name, `BedrockMantleResponsesAPIConfig` class name, `restore_model_cost` fixture name, and `get_model_info(model, "bedrock_mantle")` signature are used identically across Tasks 1-4.
+- **Type/name consistency:** `use_openai_path` flag name, `BedrockMantleResponsesAPIConfig` class name, `restore_model_cost` fixture name, `TestBedrockMantleResponsesRequestBody` class name, and `get_model_info(model, "bedrock_mantle")` signature are used identically across Tasks 1-4. `import copy` is required by both the fixture and the Task 4 guard test.
