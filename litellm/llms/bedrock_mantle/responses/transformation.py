@@ -1,8 +1,10 @@
 """
 Amazon Bedrock Mantle - Responses API backend.
 
-gpt-5.5 / gpt-5.4 on Mantle are exposed ONLY on the `/openai/v1/responses`
-path (not the standard `/v1/responses`). Payloads and SSE follow the OpenAI
+Mantle serves Responses on two upstream paths: gpt frontier models (gpt-5.5 /
+gpt-5.4) on `/openai/v1/responses`, and everything else that supports Responses
+(e.g. gpt-oss) on the standard `/v1/responses`. The gate picks the path per
+model and injects it via `use_openai_path`. Payloads and SSE follow the OpenAI
 Responses spec, so this config inherits OpenAIResponsesAPIConfig and overrides
 only the endpoint URL and Bearer authentication.
 

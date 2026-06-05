@@ -1,9 +1,10 @@
 """
 Unit tests for Amazon Bedrock Mantle Responses API configuration.
 
-Mantle's gpt-5.5 / gpt-5.4 are served ONLY on the non-standard
-`/openai/v1/responses` path. These tests lock the URL construction and
-Bearer auth that make that routing work.
+Mantle serves Responses on two paths: gpt frontier models on
+`/openai/v1/responses` and other Responses-capable models (e.g. gpt-oss) on the
+standard `/v1/responses`. These tests lock the per-model path selection in the
+gate, the URL construction for both paths, and the shared Bearer auth.
 """
 
 import copy
