@@ -319,14 +319,11 @@ class RedisSemanticCache(BaseCache):
         mirroring ``_get_async_embedding``; otherwise embeds directly.
         """
         try:
-            from litellm.proxy.proxy_server import llm_model_list, llm_router
+            from litellm.proxy.proxy_server import llm_router
         except ImportError:
-            llm_model_list = None
             llm_router = None
 
-        router = resolve_embedding_router(
-            self.embedding_model, llm_router, llm_model_list
-        )
+        router = resolve_embedding_router(self.embedding_model, llm_router)
         if router is not None:
             embedding_response = cast(
                 EmbeddingResponse,
@@ -499,14 +496,11 @@ class RedisSemanticCache(BaseCache):
             List[float]: The embedding vector
         """
         try:
-            from litellm.proxy.proxy_server import llm_model_list, llm_router
+            from litellm.proxy.proxy_server import llm_router
         except ImportError:
-            llm_model_list = None
             llm_router = None
 
-        router = resolve_embedding_router(
-            self.embedding_model, llm_router, llm_model_list
-        )
+        router = resolve_embedding_router(self.embedding_model, llm_router)
         try:
             if router is not None:
                 embedding_response = await router.aembedding(
