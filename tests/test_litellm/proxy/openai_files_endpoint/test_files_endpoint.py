@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sys
@@ -3100,3 +3101,336 @@ async def test_route_create_file_model_branch_binds_caller_identity(
     assert isinstance(identity, Verified)
     assert identity.inner_id == "file-provider-original"
     assert (identity.created_by, identity.team_id) == ("uploader", "uploader-team")
+
+
+# ---------------------------------------------------------------------------
+# Model-embedded file id ownership enforcement
+# ---------------------------------------------------------------------------
+
+FORGED_S3_URI = "s3://my-bucket/litellm-batch-outputs/litellm-batch-victim01/input.jsonl.out"
+
+# The HTTP verb and URL suffix that reach each of the three file handlers
+# under test: content read, metadata read, and delete.
+FILE_ID_ROUTES = (
+    ("get", "/content"),
+    ("get", ""),
+    ("delete", ""),
+)
+
+
+def _forged_unsigned_id(inner: str = FORGED_S3_URI, model: str = "bedrock-model") -> str:
+    """An id an attacker can build with no server secret."""
+    payload = f"litellm:{inner};model,{model}"
+    return "file-" + base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def _bedrock_router() -> Router:
+    return Router(
+        model_list=[
+            {
+                "model_name": "bedrock-model",
+                "litellm_params": {
+                    "model": "bedrock/anthropic.claude-v2",
+                    "aws_region_name": "us-east-1",
+                    "aws_access_key_id": "fake-ak",
+                    "aws_secret_access_key": "fake-sk",
+                },
+                "model_info": {"id": "bedrock-model-id"},
+            }
+        ]
+    )
+
+
+def _wire_file_proxy(monkeypatch, mocker: MockerFixture, prisma_client) -> AsyncMock:
+    """Wire the proxy so all three file handlers reach one recording mock.
+
+    ``prisma_client`` is injected into ``litellm.proxy.proxy_server`` before the
+    proxy hooks are constructed, because ``_add_proxy_hooks`` reads it there to
+    build the managed-files hook that the pre-call path actually consults.
+
+    Every upstream entrypoint is stubbed so a request that gets past the
+    ownership check succeeds loudly (200 + ``upstream.called``) rather than
+    failing for an unrelated reason, which keeps a 403 assertion honest.
+    """
+    router = _bedrock_router()
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
+    proxy_logging_obj = setup_proxy_logging_object(monkeypatch, router)
+    proxy_logging_obj.update_request_status = mocker.AsyncMock()
+    proxy_logging_obj.post_call_failure_hook = mocker.AsyncMock()
+
+    file_object = OpenAIFileObject(
+        id="file-provider-inner",
+        object="file",
+        bytes=12,
+        created_at=1234567890,
+        filename="input.jsonl.out",
+        purpose="batch",
+        status="uploaded",
+    )
+    upstream = mocker.AsyncMock(return_value=file_object)
+
+    async def _content(**kwargs):
+        await upstream(**kwargs)
+        return HttpxBinaryResponseContent(
+            response=httpx.Response(
+                status_code=200,
+                content=b"VICTIM-BYTES",
+                headers={"content-type": "application/octet-stream"},
+            )
+        )
+
+    monkeypatch.setattr(litellm, "afile_content", _content)
+    monkeypatch.setattr(litellm, "afile_retrieve", upstream)
+    monkeypatch.setattr(litellm, "afile_delete", upstream)
+
+    return upstream
+
+
+@pytest.fixture
+def file_endpoint_upstream(monkeypatch, mocker: MockerFixture) -> AsyncMock:
+    return _wire_file_proxy(monkeypatch, mocker, prisma_client=None)
+
+
+@pytest.fixture
+def victim_owned_file_upstream(monkeypatch, mocker: MockerFixture) -> AsyncMock:
+    """The same proxy, but its managed-file store holds one file owned by `victim`."""
+    victim_record = mocker.MagicMock(created_by="victim", team_id="victim-team")
+    prisma_client = mocker.MagicMock()
+    prisma_client.db.litellm_managedfiletable.find_first = mocker.AsyncMock(return_value=victim_record)
+    return _wire_file_proxy(monkeypatch, mocker, prisma_client=prisma_client)
+
+
+@pytest.fixture
+def identified_caller(monkeypatch):
+    """Authenticate every request as a concrete non-victim, non-admin tenant.
+
+    The module's default `test-key` resolves to an identity-less key, and
+    `can_access_resource` denies those outright, so a test riding on it would
+    pass no matter how the id was signed. Binding a real user_id/team_id here
+    is what makes the replay test prove tenant isolation.
+    """
+    import litellm.proxy.proxy_server as ps
+
+    app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(
+        api_key="sk-attacker", user_id="attacker", team_id="attacker-team"
+    )
+    yield
+    app.dependency_overrides.pop(ps.user_api_key_auth, None)
+
+
+@pytest.fixture
+def signing_salt(monkeypatch):
+    monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
+
+
+@pytest.mark.parametrize("method,url_suffix", FILE_ID_ROUTES)
+def test_forged_model_embedded_id_is_rejected(
+    file_endpoint_upstream: AsyncMock,
+    identified_caller,
+    signing_salt,
+    method: str,
+    url_suffix: str,
+):
+    """The reported IDOR: an unsigned model-embedded id must never be served.
+
+    Covers content read, metadata read, and delete, since all three shared the
+    same missing ownership check. An unsigned id proves nothing about who
+    minted it, so no caller may present one.
+    """
+    forged = _forged_unsigned_id()
+
+    response = getattr(client, method)(
+        f"/v1/files/{forged}{url_suffix}",
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 403, response.text
+    assert not file_endpoint_upstream.called, "forged id must never reach the provider"
+
+
+@pytest.mark.parametrize("method,url_suffix", FILE_ID_ROUTES)
+def test_other_tenant_cannot_replay_a_signed_id(
+    file_endpoint_upstream: AsyncMock,
+    identified_caller,
+    signing_salt,
+    method: str,
+    url_suffix: str,
+):
+    """A genuinely signed id must not work for a different tenant.
+
+    The signature only proves the id was minted by this proxy; the identity it
+    carries is what authorizes the request, so a valid id belonging to `victim`
+    must still be refused for `attacker`.
+    """
+    from litellm.proxy.openai_files_endpoints.common_utils import (
+        encode_file_id_with_model,
+    )
+
+    victims_id = encode_file_id_with_model(
+        FORGED_S3_URI, "bedrock-model", user_id="victim", team_id="victim-team"
+    )
+
+    response = getattr(client, method)(
+        f"/v1/files/{victims_id}{url_suffix}",
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 403, response.text
+    assert not file_endpoint_upstream.called, "another tenant's id must never reach the provider"
+
+
+@pytest.mark.parametrize("method,url_suffix", FILE_ID_ROUTES)
+def test_owner_can_still_use_their_signed_id(
+    file_endpoint_upstream: AsyncMock,
+    signing_salt,
+    method: str,
+    url_suffix: str,
+):
+    """The tenant the id was minted for keeps working, and reaches the provider
+    with the decoded inner id. Guards against the check being a blanket deny."""
+    import litellm.proxy.proxy_server as ps
+
+    from litellm.proxy.openai_files_endpoints.common_utils import (
+        encode_file_id_with_model,
+    )
+
+    own_id = encode_file_id_with_model(
+        "file-provider-inner", "bedrock-model", user_id="owner", team_id="owner-team"
+    )
+    app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(
+        api_key="sk-owner", user_id="owner", team_id="owner-team"
+    )
+
+    try:
+        response = getattr(client, method)(
+            f"/v1/files/{own_id}{url_suffix}",
+            headers={"Authorization": "Bearer test-key"},
+        )
+    finally:
+        app.dependency_overrides.pop(ps.user_api_key_auth, None)
+
+    assert response.status_code == 200, response.text
+    assert file_endpoint_upstream.call_args.kwargs["file_id"] == "file-provider-inner"
+
+
+@pytest.mark.parametrize("method,url_suffix", FILE_ID_ROUTES)
+def test_teammate_of_minting_tenant_can_use_signed_id(
+    file_endpoint_upstream: AsyncMock,
+    signing_salt,
+    method: str,
+    url_suffix: str,
+):
+    """A different user on the minting team is authorized by the signed team id,
+    matching how `can_access_resource` scopes managed unified ids."""
+    import litellm.proxy.proxy_server as ps
+
+    from litellm.proxy.openai_files_endpoints.common_utils import (
+        encode_file_id_with_model,
+    )
+
+    team_id = encode_file_id_with_model(
+        "file-provider-inner", "bedrock-model", user_id="owner", team_id="shared-team"
+    )
+    app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(
+        api_key="sk-teammate", user_id="teammate", team_id="shared-team"
+    )
+
+    try:
+        response = getattr(client, method)(
+            f"/v1/files/{team_id}{url_suffix}",
+            headers={"Authorization": "Bearer test-key"},
+        )
+    finally:
+        app.dependency_overrides.pop(ps.user_api_key_auth, None)
+
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("method,url_suffix", FILE_ID_ROUTES)
+def test_tampered_signed_id_is_rejected(
+    file_endpoint_upstream: AsyncMock,
+    signing_salt,
+    method: str,
+    url_suffix: str,
+):
+    """Swapping the signed identity for the caller's own must fail the signature.
+
+    Without this, an attacker who learns the payload format could rewrite the
+    `sub`/`tid` fields of a victim's id and authorize themselves.
+    """
+    import litellm.proxy.proxy_server as ps
+
+    from litellm.proxy.openai_files_endpoints.common_utils import (
+        encode_file_id_with_model,
+    )
+
+    victims_id = encode_file_id_with_model(
+        FORGED_S3_URI, "bedrock-model", user_id="victim", team_id="victim-team"
+    )
+    payload = base64.urlsafe_b64decode(
+        victims_id.removeprefix("file-") + "=" * (-len(victims_id.removeprefix("file-")) % 4)
+    ).decode()
+    tampered_payload = payload.replace(";sub,victim;tid,victim-team", ";sub,attacker;tid,attacker-team")
+    assert tampered_payload != payload, "the identity fields must actually have been swapped"
+    tampered_id = "file-" + base64.urlsafe_b64encode(tampered_payload.encode()).decode().rstrip("=")
+
+    app.dependency_overrides[ps.user_api_key_auth] = lambda: UserAPIKeyAuth(
+        api_key="sk-attacker", user_id="attacker", team_id="attacker-team"
+    )
+    try:
+        response = getattr(client, method)(
+            f"/v1/files/{tampered_id}{url_suffix}",
+            headers={"Authorization": "Bearer test-key"},
+        )
+    finally:
+        app.dependency_overrides.pop(ps.user_api_key_auth, None)
+
+    assert response.status_code == 403, response.text
+    assert not file_endpoint_upstream.called
+
+
+def test_plain_provider_file_id_is_unaffected(
+    file_endpoint_upstream: AsyncMock,
+    identified_caller,
+    signing_salt,
+):
+    """A plain provider id carries no embedded identity, so the model-embedded
+    check must pass it straight through to its existing handling."""
+    response = client.get(
+        "/v1/files/file-abc123",
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert file_endpoint_upstream.call_args.kwargs["file_id"] == "file-abc123"
+
+
+@pytest.mark.parametrize("method,url_suffix", FILE_ID_ROUTES)
+@pytest.mark.parametrize("query", ["", "?model=bedrock-model"])
+def test_unified_id_ownership_check_survives_a_model_query_param(
+    victim_owned_file_upstream: AsyncMock,
+    identified_caller,
+    method: str,
+    url_suffix: str,
+    query: str,
+):
+    """Appending ?model=X to another tenant's unified id must not buy access.
+
+    A model query param is one of the sources `handle_model_based_routing`
+    consults, so it can steer a unified id onto the model-routing path and away
+    from the branch that checks unified ownership. The check must hold anyway.
+    """
+    unified_raw = (
+        "litellm_proxy:application/octet-stream;unified_id,victim-file-1;target_model_names,bedrock-model"
+    )
+    unified_id = base64.urlsafe_b64encode(unified_raw.encode()).decode().rstrip("=")
+
+    response = getattr(client, method)(
+        f"/v1/files/{unified_id}{url_suffix}{query}",
+        headers={"Authorization": "Bearer test-key"},
+    )
+
+    assert response.status_code == 403, response.text
+    assert not victim_owned_file_upstream.called

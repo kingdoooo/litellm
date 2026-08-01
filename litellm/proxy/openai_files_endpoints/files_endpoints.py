@@ -51,6 +51,9 @@ from litellm.proxy.openai_files_endpoints.common_utils import (
     prepare_data_with_credentials,
     validate_managed_files_requirement,
 )
+from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import (
+    authorize_model_embedded_file_id,
+)
 from litellm.proxy.utils import ProxyLogging, is_known_model
 from litellm.repositories.table_repositories import ManagedFileRepository
 from litellm.router import Router
@@ -732,6 +735,9 @@ async def get_file_content(
                     status_code=400,
                     detail="Raw cloud storage file ids cannot be retrieved directly. Use the LiteLLM managed file id returned when the file was created.",
                 )
+
+            authorize_model_embedded_file_id(file_id, user_api_key_dict)
+
             # Check for model-based credential routing
             (
                 should_route,
@@ -940,9 +946,11 @@ async def get_file(
             route_type="afile_retrieve",
         )
 
-        ## Check for model-based credential routing
         from litellm.proxy.proxy_server import llm_router
 
+        authorize_model_embedded_file_id(file_id, user_api_key_dict)
+
+        ## Check for model-based credential routing
         (
             should_route,
             model_used,
@@ -1139,6 +1147,8 @@ async def delete_file(
             version=version,
             proxy_config=proxy_config,
         )
+
+        authorize_model_embedded_file_id(file_id, user_api_key_dict)
 
         # Check for model-based credential routing
         (
