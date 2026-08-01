@@ -205,3 +205,23 @@ def test_rotating_the_salt_invalidates_existing_signatures(monkeypatch):
     signed = sign_model_embedded_payload(f"litellm:{S3_URI};model,bedrock-claude", user_id="u1", team_id="t1")
     monkeypatch.setenv("LITELLM_SALT_KEY", "a-different-salt")
     assert isinstance(verify_model_embedded_file_id(_encode(signed)), BadSignature)
+
+
+def test_missing_key_material_denies_instead_of_signing_with_an_empty_key(monkeypatch):
+    """With no salt and no master_key the HMAC key would be derived from an empty
+    string, so anyone who knows the scheme could forge a signature. Both minting
+    and verification must fail closed rather than trust it."""
+    import litellm.proxy.proxy_server as proxy_server
+
+    monkeypatch.delenv("LITELLM_SALT_KEY", raising=False)
+    monkeypatch.setattr(proxy_server, "master_key", None, raising=False)
+
+    with pytest.raises(ValueError, match="LITELLM_SALT_KEY"):
+        sign_model_embedded_payload(
+            f"litellm:{S3_URI};model,bedrock-claude", user_id="u1", team_id="t1"
+        )
+
+    forged = _encode(
+        f"litellm:{S3_URI};model,bedrock-claude;sub,victim;tid,vteam;sig,deadbeef"
+    )
+    assert isinstance(verify_model_embedded_file_id(forged), BadSignature)

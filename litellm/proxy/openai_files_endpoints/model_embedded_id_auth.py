@@ -55,7 +55,12 @@ IdentityVerification = NotModelEmbedded | Unsigned | BadSignature | Verified
 def _signing_key() -> bytes:
     from litellm.proxy.common_utils.encrypt_decrypt_utils import _get_salt_key
 
-    salt = _get_salt_key() or ""
+    salt = _get_salt_key()
+    if not salt:
+        raise ValueError(
+            "Signing model-embedded file ids requires key material: set LITELLM_SALT_KEY "
+            "(or a master key). Without it the signature is forgeable."
+        )
     return hmac.new(salt.encode(), _KEY_LABEL, hashlib.sha256).digest()
 
 
@@ -98,7 +103,11 @@ def verify_model_embedded_file_id(file_id: str) -> IdentityVerification:
         return Unsigned()
 
     signing_input, _, signature = payload.rpartition(_SIG_FIELD)
-    if not hmac.compare_digest(signature.encode(), _signature_for(signing_input).encode()):
+    try:
+        expected = _signature_for(signing_input)
+    except ValueError:
+        return BadSignature()
+    if not hmac.compare_digest(signature.encode(), expected.encode()):
         return BadSignature()
 
     # The inner id is caller-chosen and may itself contain these delimiters, so the
