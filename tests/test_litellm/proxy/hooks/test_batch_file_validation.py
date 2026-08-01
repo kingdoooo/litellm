@@ -13,6 +13,9 @@ import pytest
 from fastapi import HTTPException
 
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+from litellm.proxy.openai_files_endpoints.common_utils import (
+    encode_file_id_with_model,
+)
 
 
 def _models(file_content_as_dict):
@@ -670,19 +673,15 @@ async def test_pre_call_does_not_skip_for_spoofed_provider():
 
 @pytest.mark.asyncio
 async def test_count_input_file_usage_decodes_model_embedded_file_id():
-    import base64
-
     from litellm.proxy.hooks.batch_rate_limiter import _PROXY_BatchRateLimiter
 
     original_file_id = "file-provider-xyz"
-    encoded_payload = (
-        base64.urlsafe_b64encode(
-            f"litellm:{original_file_id};model,my-vllm-batch".encode()
-        )
-        .decode()
-        .rstrip("=")
+    encoded_file_id = encode_file_id_with_model(
+        file_id=original_file_id,
+        model="my-vllm-batch",
+        user_id="alice",
+        team_id="alice-team",
     )
-    encoded_file_id = f"file-{encoded_payload}"
 
     rate_limiter = _PROXY_BatchRateLimiter(
         internal_usage_cache=MagicMock(),
@@ -932,16 +931,15 @@ def test_get_batch_routing_model_returns_none_without_model_or_file():
 
 
 def test_get_batch_routing_model_decodes_model_embedded_file_id():
-    import base64
-
     rate_limiter = _make_rate_limiter()
-    encoded = (
-        base64.urlsafe_b64encode(b"litellm:file-xyz;model,vllm-batch")
-        .decode()
-        .rstrip("=")
+    encoded_file_id = encode_file_id_with_model(
+        file_id="file-xyz",
+        model="vllm-batch",
+        user_id="alice",
+        team_id="alice-team",
     )
     assert (
-        rate_limiter._get_batch_routing_model({"input_file_id": f"file-{encoded}"})
+        rate_limiter._get_batch_routing_model({"input_file_id": encoded_file_id})
         == "vllm-batch"
     )
 

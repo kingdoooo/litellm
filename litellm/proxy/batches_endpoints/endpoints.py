@@ -211,17 +211,25 @@ async def create_batch(
                     file_id=original_batch_id,
                     model=model_from_file_id,
                     id_type="batch",
+                    user_id=user_api_key_dict.user_id,
+                    team_id=user_api_key_dict.team_id,
                 )
                 response.id = encoded_batch_id
 
                 if hasattr(response, "output_file_id") and response.output_file_id:
                     response.output_file_id = encode_file_id_with_model(
-                        file_id=response.output_file_id, model=model_from_file_id
+                        file_id=response.output_file_id,
+                        model=model_from_file_id,
+                        user_id=user_api_key_dict.user_id,
+                        team_id=user_api_key_dict.team_id,
                     )
 
                 if hasattr(response, "error_file_id") and response.error_file_id:
                     response.error_file_id = encode_file_id_with_model(
-                        file_id=response.error_file_id, model=model_from_file_id
+                        file_id=response.error_file_id,
+                        model=model_from_file_id,
+                        user_id=user_api_key_dict.user_id,
+                        team_id=user_api_key_dict.team_id,
                     )
 
                 verbose_proxy_logger.debug(
@@ -291,7 +299,12 @@ async def create_batch(
                     **_create_batch_data,  # type: ignore
                 )
 
-                encode_batch_response_ids(response, model=model_param)
+                encode_batch_response_ids(
+                    response,
+                    model=model_param,
+                    user_id=user_api_key_dict.user_id,
+                    team_id=user_api_key_dict.team_id,
+                )
 
                 verbose_proxy_logger.debug(f"Created batch using model: {model_param}")
             else:
@@ -504,7 +517,12 @@ async def retrieve_batch(
                 **data,  # type: ignore
             )
 
-            encode_batch_response_ids(response, model=model_from_id)
+            encode_batch_response_ids(
+                response,
+                model=model_from_id,
+                user_id=user_api_key_dict.user_id,
+                team_id=user_api_key_dict.team_id,
+            )
 
             verbose_proxy_logger.debug(
                 f"Retrieved batch using model: {model_from_id}, original_id: {original_batch_id}"
@@ -702,10 +720,14 @@ async def list_batches(
 
             # Encode batch IDs in the list response so clients can use
             # them for retrieve/cancel/file downloads through the proxy.
+            # Minted unsigned: this listing is scoped only by the upstream
+            # deployment credentials, so it returns every batch under that
+            # provider key regardless of which LiteLLM caller created it.
+            # Signing here would bind the caller to batches they do not own.
             response_data = getattr(response, "data", None)
             if response_data:
                 for batch in response_data:
-                    encode_batch_response_ids(batch, model=model_param)
+                    encode_batch_response_ids(batch, model=model_param, sign=False)
 
             verbose_proxy_logger.debug(f"Listed batches using model: {model_param}")
 
@@ -887,7 +909,12 @@ async def cancel_batch(
                 **data,  # type: ignore
             )
 
-            encode_batch_response_ids(response, model=model_from_id)
+            encode_batch_response_ids(
+                response,
+                model=model_from_id,
+                user_id=user_api_key_dict.user_id,
+                team_id=user_api_key_dict.team_id,
+            )
 
             verbose_proxy_logger.debug(
                 f"Cancelled batch using model: {model_from_id}, original_id: {original_batch_id}"

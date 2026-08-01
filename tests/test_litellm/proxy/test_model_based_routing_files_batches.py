@@ -6,10 +6,11 @@ Tests the model-based routing ID encoding/decoding used by the batch
 and file proxy endpoints.
 """
 
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 from litellm.proxy.openai_files_endpoints.common_utils import (
     decode_model_from_file_id,
+    encode_batch_response_ids,
     encode_file_id_with_model,
     get_original_file_id,
     prepare_data_with_credentials,
@@ -129,6 +130,106 @@ class TestRoundTrip:
         assert encoded.startswith("file-")
         assert decode_model_from_file_id(encoded) == model
         assert get_original_file_id(encoded) == original
+
+
+class TestMintingBindsIdentity:
+    """Minting must bind the caller so verification can authorize later."""
+
+    def test_encoded_id_carries_signed_identity(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
+        from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import (
+            Verified,
+            verify_model_embedded_file_id,
+        )
+
+        encoded = encode_file_id_with_model(
+            "file-abc123", "gpt-4o", user_id="u1", team_id="t1"
+        )
+        result = verify_model_embedded_file_id(encoded)
+        assert isinstance(result, Verified)
+        assert (result.created_by, result.team_id) == ("u1", "t1")
+        assert result.inner_id == "file-abc123"
+
+    def test_prefix_is_still_derived_from_the_inner_id(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
+        assert encode_file_id_with_model(
+            "batch_abc", "gpt-4o", user_id="u1", team_id="t1"
+        ).startswith("batch_")
+        assert encode_file_id_with_model(
+            "file-abc", "gpt-4o", user_id="u1", team_id="t1"
+        ).startswith("file-")
+
+    def test_sign_false_mints_an_unsigned_id(self, monkeypatch):
+        """list_batches cannot prove ownership, so it must mint unsigned."""
+        monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
+        from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import (
+            Unsigned,
+            verify_model_embedded_file_id,
+        )
+
+        encoded = encode_file_id_with_model("batch_abc", "gpt-4o", sign=False)
+        assert isinstance(verify_model_embedded_file_id(encoded), Unsigned)
+
+    def test_decoders_still_work_on_signed_ids(self, monkeypatch):
+        """auth_utils and batch_rate_limiter decode without identity in scope."""
+        monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
+        encoded = encode_file_id_with_model(
+            "s3://bucket/litellm-batch-outputs/j/in.jsonl.out",
+            "bedrock-claude",
+            user_id="u1",
+            team_id="t1",
+        )
+        assert decode_model_from_file_id(encoded) == "bedrock-claude"
+        assert (
+            get_original_file_id(encoded)
+            == "s3://bucket/litellm-batch-outputs/j/in.jsonl.out"
+        )
+
+
+class TestBatchResponseIdsBindIdentity:
+    """encode_batch_response_ids must thread identity to every id it rewrites."""
+
+    def test_every_rewritten_id_carries_the_caller(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
+        from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import (
+            Verified,
+            verify_model_embedded_file_id,
+        )
+
+        response = SimpleNamespace(
+            id="batch_abc",
+            output_file_id="file-out",
+            error_file_id="file-err",
+            input_file_id="file-in",
+        )
+
+        encode_batch_response_ids(response, model="gpt-4o", user_id="u1", team_id="t1")
+
+        for attr in ("id", "output_file_id", "error_file_id", "input_file_id"):
+            result = verify_model_embedded_file_id(getattr(response, attr))
+            assert isinstance(result, Verified), attr
+            assert (result.created_by, result.team_id) == ("u1", "t1"), attr
+
+    def test_sign_false_leaves_every_id_unsigned(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
+        from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import (
+            Unsigned,
+            verify_model_embedded_file_id,
+        )
+
+        response = SimpleNamespace(
+            id="batch_abc",
+            output_file_id="file-out",
+            error_file_id="file-err",
+            input_file_id="file-in",
+        )
+
+        encode_batch_response_ids(response, model="gpt-4o", sign=False)
+
+        for attr in ("id", "output_file_id", "error_file_id", "input_file_id"):
+            assert isinstance(
+                verify_model_embedded_file_id(getattr(response, attr)), Unsigned
+            ), attr
 
 
 class TestDecodeEdgeCases:

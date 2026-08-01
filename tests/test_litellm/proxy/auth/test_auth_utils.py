@@ -474,6 +474,8 @@ def test_get_model_from_request_extracts_simple_encoded_file_id_model():
     file_id = encode_file_id_with_model(
         file_id="file-provider-id",
         model="restricted-model",
+        user_id="alice",
+        team_id="alice-team",
     )
 
     assert (

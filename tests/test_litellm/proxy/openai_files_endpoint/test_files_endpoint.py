@@ -3051,3 +3051,52 @@ def test_list_files_key_allowed_openai_model_still_resolves_team_credentials(
         mocker, monkeypatch, _team_openai_plus_global_anthropic_router(), ["team-gpt"]
     )
     assert captured_kwargs.get("api_key") == "team-openai-key"
+
+
+@pytest.mark.asyncio
+async def test_route_create_file_model_branch_binds_caller_identity(
+    monkeypatch, llm_router: Router
+):
+    """The model-routing upload path mints a model-embedded file id, which is the
+    only proof of ownership those DB-free ids carry. It must therefore bind the
+    uploading caller; an id minted without one authorizes nobody."""
+    monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
+
+    from litellm.proxy.openai_files_endpoints.files_endpoints import route_create_file
+    from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import (
+        Verified,
+        verify_model_embedded_file_id,
+    )
+
+    async def _mock_acreate_file(**kwargs):
+        return OpenAIFileObject(
+            id="file-provider-original",
+            object="file",
+            bytes=1,
+            created_at=1234567890,
+            filename="batch.jsonl",
+            purpose="batch",
+            status="uploaded",
+        )
+
+    monkeypatch.setattr(litellm, "acreate_file", _mock_acreate_file)
+
+    response = await route_create_file(
+        llm_router=llm_router,
+        _create_file_request={"file": ("batch.jsonl", b"{}", "application/jsonl")},
+        purpose="batch",
+        proxy_logging_obj=ProxyLogging(user_api_key_cache=DualCache()),
+        user_api_key_dict=UserAPIKeyAuth(
+            api_key="sk-test", user_id="uploader", team_id="uploader-team"
+        ),
+        target_model_names_list=[],
+        is_router_model=False,
+        router_model=None,
+        custom_llm_provider="openai",
+        model="azure-gpt-3-5-turbo",
+    )
+
+    identity = verify_model_embedded_file_id(response.id)
+    assert isinstance(identity, Verified)
+    assert identity.inner_id == "file-provider-original"
+    assert (identity.created_by, identity.team_id) == ("uploader", "uploader-team")

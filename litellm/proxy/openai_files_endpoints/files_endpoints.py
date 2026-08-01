@@ -206,7 +206,12 @@ async def route_create_file(
         # Encode the file ID with model information
         if response and hasattr(response, "id") and response.id:
             original_id = response.id
-            encoded_id = encode_file_id_with_model(file_id=original_id, model=model)
+            encoded_id = encode_file_id_with_model(
+                file_id=original_id,
+                model=model,
+                user_id=user_api_key_dict.user_id,
+                team_id=user_api_key_dict.team_id,
+            )
             response.id = encoded_id
             verbose_proxy_logger.debug(f"Encoded file ID: {original_id} -> {encoded_id} (model: {model})")
 

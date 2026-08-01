@@ -45,6 +45,8 @@ BEDROCK_BATCH_ARN = (
 BEDROCK_OUTPUT_S3_URI = (
     "s3://test-bedrock-batch-output/job-output/test-job-id/output.jsonl.out"
 )
+CALLER_USER_ID = "bedrock-caller"
+CALLER_TEAM_ID = "bedrock-team"
 
 
 @pytest.fixture
@@ -78,7 +80,11 @@ def _setup_proxy(monkeypatch, llm_router: Router):
 
 def _encoded_bedrock_batch_id() -> str:
     return encode_file_id_with_model(
-        file_id=BEDROCK_BATCH_ARN, model=BEDROCK_MODEL, id_type="batch"
+        file_id=BEDROCK_BATCH_ARN,
+        model=BEDROCK_MODEL,
+        id_type="batch",
+        user_id=CALLER_USER_ID,
+        team_id=CALLER_TEAM_ID,
     )
 
 
@@ -105,7 +111,7 @@ def test_retrieve_batch_passes_model_for_bedrock_encoded_id(
     """
     _setup_proxy(monkeypatch, bedrock_router)
 
-    user_key = UserAPIKeyAuth(api_key="test-key")
+    user_key = UserAPIKeyAuth(api_key="test-key", user_id=CALLER_USER_ID, team_id=CALLER_TEAM_ID)
     app.dependency_overrides[user_api_key_auth] = lambda: user_key
 
     encoded_batch_id = _encoded_bedrock_batch_id()
@@ -142,7 +148,7 @@ def test_retrieve_batch_response_id_is_re_encoded_with_model(
     bedrock."""
     _setup_proxy(monkeypatch, bedrock_router)
 
-    user_key = UserAPIKeyAuth(api_key="test-key")
+    user_key = UserAPIKeyAuth(api_key="test-key", user_id=CALLER_USER_ID, team_id=CALLER_TEAM_ID)
     app.dependency_overrides[user_api_key_auth] = lambda: user_key
 
     encoded_batch_id = _encoded_bedrock_batch_id()
@@ -178,11 +184,15 @@ def test_file_content_routes_to_bedrock_for_encoded_output_file_id(
     """
     _setup_proxy(monkeypatch, bedrock_router)
 
-    user_key = UserAPIKeyAuth(api_key="test-key")
+    user_key = UserAPIKeyAuth(api_key="test-key", user_id=CALLER_USER_ID, team_id=CALLER_TEAM_ID)
     app.dependency_overrides[user_api_key_auth] = lambda: user_key
 
     encoded_file_id = encode_file_id_with_model(
-        file_id=BEDROCK_OUTPUT_S3_URI, model=BEDROCK_MODEL, id_type="file"
+        file_id=BEDROCK_OUTPUT_S3_URI,
+        model=BEDROCK_MODEL,
+        id_type="file",
+        user_id=CALLER_USER_ID,
+        team_id=CALLER_TEAM_ID,
     )
     captured_kwargs: dict = {}
     file_bytes = b'{"custom_id":"r1","response":{"body":{"choices":[]}}}\n'

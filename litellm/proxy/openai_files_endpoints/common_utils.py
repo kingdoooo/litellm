@@ -92,11 +92,19 @@ def get_batch_id_from_unified_batch_id(file_id: str) -> str:
     return re.split(r"[;,]", batch_id, maxsplit=1)[0]
 
 
-def encode_file_id_with_model(file_id: str, model: str, id_type: Literal["file", "batch"] = "file") -> str:
+def encode_file_id_with_model(
+    file_id: str,
+    model: str,
+    id_type: Literal["file", "batch"] = "file",
+    *,
+    user_id: str | None = None,
+    team_id: str | None = None,
+    sign: bool = True,
+) -> str:
     """
     Encode a file/batch ID with model routing information.
 
-    Format: <prefix><base64(litellm:<original_id>;model,<model_name>)>
+    Format: <prefix><base64(litellm:<original_id>;model,<model_name>;sub,<user_id>;tid,<team_id>;sig,<hmac>)>
     The result preserves the original prefix (file-, batch_, etc.) for OpenAI compliance.
 
     Args:
@@ -105,23 +113,24 @@ def encode_file_id_with_model(file_id: str, model: str, id_type: Literal["file",
         id_type: Type of ID being encoded. Used to determine the correct prefix when
                  the raw ID lacks a recognizable prefix (e.g., Vertex AI numeric IDs).
                  Defaults to "file" for backward compatibility.
+        user_id: Minting caller's user id, signed into the ID so a later request
+                 carrying it can be authorized against its creator.
+        team_id: Minting caller's team id, signed alongside user_id.
+        sign: Set False only where the minting caller cannot be shown to own the
+              resource (a provider-wide listing), so the ID is never presented as
+              proof of ownership.
 
     Returns:
         Encoded ID starting with appropriate prefix and containing routing information
-
-    Examples:
-        encode_file_id_with_model("file-abc123", "gpt-4o-litellm")
-        -> "file-bGl0ZWxsbTpmaWxlLWFiYzEyMzttb2RlbCxncHQtNG8taWZvb2Q"
-
-        encode_file_id_with_model("batch_abc123", "gpt-4o-test")
-        -> "batch_bGl0ZWxsbTpiYXRjaF9hYmMxMjM7bW9kZWwsZ3B0LTRvLXRlc3Q"
-
-        encode_file_id_with_model("3814889423749775360", "gemini-2.5-pro", id_type="batch")
-        -> "batch_bGl0ZWxsbTozODE0ODg5NDIzNzQ5Nzc1MzYwO21vZGVsLGdlbWluaS0yLjUtcHJv"
     """
-    encoded_str = f"litellm:{file_id};model,{model}"
-    encoded_bytes = base64.urlsafe_b64encode(encoded_str.encode())
-    encoded_b64 = encoded_bytes.decode().rstrip("=")
+    payload = f"litellm:{file_id};model,{model}"
+    if sign:
+        from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import (
+            sign_model_embedded_payload,
+        )
+
+        payload = sign_model_embedded_payload(payload, user_id=user_id, team_id=team_id)
+    encoded_b64 = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
 
     # Detect the prefix from the original ID (file-, batch_, etc.)
     # For provider-specific IDs without a recognizable prefix (e.g., Vertex AI
@@ -136,17 +145,37 @@ def encode_file_id_with_model(file_id: str, model: str, id_type: Literal["file",
     return f"{prefix}{encoded_b64}"
 
 
-def encode_batch_response_ids(response, model: str) -> None:
+def encode_batch_response_ids(
+    response,
+    model: str,
+    *,
+    user_id: str | None = None,
+    team_id: str | None = None,
+    sign: bool = True,
+) -> None:
     """Encode all IDs in a batch response with model routing info (in-place)."""
     if not response or not hasattr(response, "id") or not response.id:
         return
-    response.id = encode_file_id_with_model(file_id=response.id, model=model, id_type="batch")
+    response.id = encode_file_id_with_model(
+        file_id=response.id,
+        model=model,
+        id_type="batch",
+        user_id=user_id,
+        team_id=team_id,
+        sign=sign,
+    )
     for attr in ("output_file_id", "error_file_id", "input_file_id"):
         if hasattr(response, attr) and getattr(response, attr):
             setattr(
                 response,
                 attr,
-                encode_file_id_with_model(file_id=getattr(response, attr), model=model),
+                encode_file_id_with_model(
+                    file_id=getattr(response, attr),
+                    model=model,
+                    user_id=user_id,
+                    team_id=team_id,
+                    sign=sign,
+                ),
             )
 
 

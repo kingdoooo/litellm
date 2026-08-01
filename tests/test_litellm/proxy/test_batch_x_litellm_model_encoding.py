@@ -382,7 +382,11 @@ class TestBatchIdRoundTripWithRetrieve:
 
         # What create_batch does:
         encoded_id = encode_file_id_with_model(
-            file_id=raw_batch_id, model=model_name, id_type="batch"
+            file_id=raw_batch_id,
+            model=model_name,
+            id_type="batch",
+            user_id="alice",
+            team_id="alice-team",
         )
 
         # What retrieve_batch does:
@@ -409,7 +413,11 @@ class TestBatchIdRoundTripWithRetrieve:
 
         for raw_id, model in test_cases:
             encoded = encode_file_id_with_model(
-                file_id=raw_id, model=model, id_type="batch"
+                file_id=raw_id,
+                model=model,
+                id_type="batch",
+                user_id="alice",
+                team_id="alice-team",
             )
             assert encoded.startswith("batch_")
             assert decode_model_from_file_id(encoded) == model

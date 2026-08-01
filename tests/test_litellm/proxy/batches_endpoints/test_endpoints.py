@@ -75,6 +75,11 @@ CREDS: Dict[str, Dict[str, str]] = {
     },
 }
 
+# A caller carrying a user_id and team_id, used by the identity-binding tests
+# below. The other tests default to an identity-less key, which keeps the
+# provider-credential fallback branches on their pre-existing path.
+IDENTIFIED_CALLER = UserAPIKeyAuth(api_key="sk-test", user_id="caller-user", team_id="caller-team")
+
 # A real model-encoded file id: decodes to "azure/gpt-4o", strips to "file-original123".
 AZURE_FILE_ID = encode_file_id_with_model("file-original123", "azure/gpt-4o", id_type="file")
 
@@ -1539,8 +1544,10 @@ async def test_list__model_from_body_routes_and_encodes(list_harness):
     assert list_harness.litellm_alist.call_count == 1
     list_harness.router_alist.assert_not_called()
     list_harness.creds_resolver.assert_called_once_with(model_id="azure/gpt-4o")
-    assert resp.data[0].id == encode_file_id_with_model("batch-1", "azure/gpt-4o", id_type="batch")
-    assert resp.data[1].id == encode_file_id_with_model("batch-2", "azure/gpt-4o", id_type="batch")
+    # Unsigned, unlike every other branch: this listing is scoped only by the
+    # upstream provider key, so the caller is not known to own what came back.
+    assert resp.data[0].id == encode_file_id_with_model("batch-1", "azure/gpt-4o", id_type="batch", sign=False)
+    assert resp.data[1].id == encode_file_id_with_model("batch-2", "azure/gpt-4o", id_type="batch", sign=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -2242,3 +2249,105 @@ async def test_cancel__provider_only_resolves_named_vertex_credentials(cancel_ha
         "vertex_location": "us-central1",
         "vertex_credentials": "/creds/customer-sa.json",
     }
+
+
+# =========================================================================== #
+# IDENTITY BINDING - every id this layer mints must carry the caller's signed
+# identity, so a later request presenting that id can be authorized against its
+# creator. A mint site that forgets to pass user_id/team_id signs an empty
+# identity, which authorizes nobody; these tests fail in that case.
+#
+# list_batches is the deliberate exception: it is scoped only by the upstream
+# provider credentials, so it mints unsigned rather than vouching for batches
+# the caller may not own.
+# =========================================================================== #
+
+
+def _minted_identity(encoded_id: str):
+    from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import (
+        verify_model_embedded_file_id,
+    )
+
+    return verify_model_embedded_file_id(encoded_id)
+
+
+@pytest.fixture
+def signing_salt(monkeypatch):
+    """Pins the key the mint and the verification below share, so the assertions
+    do not depend on whatever salt the environment happens to carry."""
+    monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
+
+
+@pytest.mark.asyncio
+async def test_create__model_encoded_file_id__binds_caller_to_every_minted_id(harness, signing_salt):
+    from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import Verified
+
+    set_body(
+        harness,
+        {
+            "input_file_id": AZURE_FILE_ID,
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+        },
+    )
+    harness.litellm_acreate.return_value = make_batch(
+        output_file_id="file-out-raw", error_file_id="file-err-raw"
+    )
+
+    resp = await call_create(harness, user=IDENTIFIED_CALLER)
+
+    for minted in (resp.id, resp.output_file_id, resp.error_file_id):
+        identity = _minted_identity(minted)
+        assert isinstance(identity, Verified), minted
+        assert (identity.created_by, identity.team_id) == ("caller-user", "caller-team")
+
+
+@pytest.mark.asyncio
+async def test_create__model_param__binds_caller_to_minted_id(harness, signing_salt):
+    from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import Verified
+
+    set_body(
+        harness,
+        {
+            "input_file_id": "file-plain",
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+            "model": "vertex-model",
+        },
+    )
+
+    resp = await call_create(harness, user=IDENTIFIED_CALLER)
+
+    identity = _minted_identity(resp.id)
+    assert isinstance(identity, Verified)
+    assert (identity.created_by, identity.team_id) == ("caller-user", "caller-team")
+
+
+@pytest.mark.asyncio
+async def test_retrieve__model_encoded_id__binds_caller_to_minted_id(retrieve_harness, signing_salt):
+    from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import Verified
+
+    resp = await call_retrieve(retrieve_harness, AZURE_BATCH_ID, user=IDENTIFIED_CALLER)
+
+    identity = _minted_identity(resp.id)
+    assert isinstance(identity, Verified)
+    assert (identity.created_by, identity.team_id) == ("caller-user", "caller-team")
+
+
+@pytest.mark.asyncio
+async def test_cancel__model_encoded_id__binds_caller_to_minted_id(cancel_harness, signing_salt):
+    from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import Verified
+
+    resp = await call_cancel(cancel_harness, AZURE_BATCH_ID, user=IDENTIFIED_CALLER)
+
+    identity = _minted_identity(resp.id)
+    assert isinstance(identity, Verified)
+    assert (identity.created_by, identity.team_id) == ("caller-user", "caller-team")
+
+
+#
+# list_batches has no test here: its model branch raises the duplicate
+# custom_llm_provider TypeError before reaching its mint line, so the mint is
+# unreachable end-to-end today. Its unsigned contract is asserted by the strict
+# xfail test above (which goes live the day that branch is fixed) and by
+# test_model_based_routing_files_batches.py's sign=False unit coverage.
