@@ -466,10 +466,13 @@ def test_get_model_from_request_authorizes_all_file_routing_model_sources():
     }
 
 
-def test_get_model_from_request_extracts_simple_encoded_file_id_model():
+def test_get_model_from_request_extracts_simple_encoded_file_id_model(monkeypatch):
     from litellm.proxy.openai_files_endpoints.common_utils import (
         encode_file_id_with_model,
     )
+
+    # Minting needs key material; signing refuses to fall back to an empty key.
+    monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
 
     file_id = encode_file_id_with_model(
         file_id="file-provider-id",

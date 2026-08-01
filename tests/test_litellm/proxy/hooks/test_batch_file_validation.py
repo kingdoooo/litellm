@@ -18,6 +18,13 @@ from litellm.proxy.openai_files_endpoints.common_utils import (
 )
 
 
+@pytest.fixture(autouse=True)
+def signing_salt(monkeypatch):
+    """Minting a model-embedded id needs key material; a real proxy always has a
+    master key, and signing refuses to fall back to an empty one."""
+    monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt-key-for-signing")
+
+
 def _models(file_content_as_dict):
     """Distinct body.model values, mirroring how the rate limiter collects the
     models from a streamed batch file before the access check."""
