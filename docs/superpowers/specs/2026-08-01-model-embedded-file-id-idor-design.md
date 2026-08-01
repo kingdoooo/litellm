@@ -211,18 +211,31 @@ plumbing through call chains is required:
 | `batches_endpoints/endpoints.py:664` | `list_batches` (`:574`) |
 | `batches_endpoints/endpoints.py:840` | `cancel_batch` (`:749`) |
 
-### Open item to verify during implementation
+### `list_batches` must not sign (resolved)
 
-`encode_batch_response_ids` at `endpoints.py:664` re-signs every batch in a
-`list_batches` response. If that response can contain another tenant's batch,
-signing it would bind the *caller* to a resource they do not own, converting
-this fix into the vulnerability it is meant to close.
+`encode_batch_response_ids` at `endpoints.py:664` re-encodes every batch in a
+model-routed `list_batches` response. That path calls `litellm.alist_batches`,
+documented as "List your organization's batches"
+(`litellm/batches/main.py:654`) and scoped only by the upstream deployment
+credentials. It therefore returns every batch created with that provider API
+key, across all LiteLLM tenants sharing the deployment.
 
-Two mechanisms suggest it cannot: the provider-level listing is scoped by the
-upstream deployment credentials, and the managed path filters by owner through
-`build_owner_filter` (`isolation.py:33-69`). This must be confirmed by reading
-the list path rather than assumed. If foreign batches can appear, minting must
-be skipped for them instead of signed.
+Signing there would bind the *calling* user to batches they do not own, minting
+exactly the credential the rest of this design exists to prevent. It would also
+hand an attacker an official signature-issuing oracle: call `list_batches`
+once, collect valid signed ids for other tenants' batches, and the fix is void.
+
+Therefore the model-routed `list_batches` path mints **unsigned** ids. Ids
+obtained from it are consequently not usable for `retrieve`, `cancel`, or file
+download, which will answer 403. Callers needing usable ids must use the
+managed path, which is already owner-filtered through `build_owner_filter`
+(`isolation.py:33-69`). This is a deliberate behaviour change and needs a
+release note alongside the unsigned-id rejection.
+
+The general rule this expresses: sign only where ownership is known at mint
+time. `create_file`, `create_batch`, `retrieve_batch`, and `cancel_batch` all
+act on a single resource the caller just created or already passed
+authorization for; a provider-wide listing does not.
 
 ## Testing
 
