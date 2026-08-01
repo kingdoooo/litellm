@@ -29,6 +29,7 @@ added to this layer raises instead of silently passing - the inventory of seams
 cannot drift without a test failure.
 """
 
+import base64
 import os
 import sys
 from contextlib import ExitStack
@@ -54,6 +55,11 @@ from litellm.types.llms.openai import BatchJobStatus
 from litellm.types.utils import CredentialItem, LiteLLMBatch
 
 from fastapi import Response
+
+# Pinned before the module-level ids below are minted so they are signed with the
+# same key the `signing_salt` fixture installs; otherwise an id minted at import
+# time would fail verification inside a salt-pinned test.
+os.environ["LITELLM_SALT_KEY"] = "test-salt-key-for-signing"
 
 # --------------------------------------------------------------------------- #
 # Fixtures: distinguishable credentials per model so a wrong/hardcoded model_id
@@ -916,8 +922,17 @@ async def test_create__exception_calls_failure_hook(harness):
 
 # A real model-encoded BATCH id: decodes to "azure/gpt-4o", strips to
 # "batch_orig123". Distinct from AZURE_FILE_ID so retrieve tests can't pass by
-# accidentally reusing the create fixture's value.
-AZURE_BATCH_ID = encode_file_id_with_model("batch_orig123", "azure/gpt-4o", id_type="batch")
+# accidentally reusing the create fixture's value. Minted for IDENTIFIED_CALLER
+# because retrieve/cancel now authorize the signed identity, and an identity-less
+# caller cannot read back even its own id (can_access_resource guards the
+# None == None bypass, so two identity-less keys can never see each other).
+AZURE_BATCH_ID = encode_file_id_with_model(
+    "batch_orig123",
+    "azure/gpt-4o",
+    id_type="batch",
+    user_id="caller-user",
+    team_id="caller-team",
+)
 
 # A realistic decoded unified batch id (what _is_base64_encoded_unified_file_id
 # returns). model_id / llm_batch_id are parsed out of this by the real helpers.
@@ -1062,7 +1077,7 @@ async def call_retrieve(
 
 @pytest.mark.asyncio
 async def test_retrieve__model_encoded_id(retrieve_harness):
-    resp = await call_retrieve(retrieve_harness, AZURE_BATCH_ID)
+    resp = await call_retrieve(retrieve_harness, AZURE_BATCH_ID, user=IDENTIFIED_CALLER)
 
     # 1. DISPATCH - model-credential path fired via litellm, router did not.
     assert retrieve_harness.litellm_aretrieve.call_count == 1
@@ -1083,7 +1098,7 @@ async def test_retrieve__model_encoded_id(retrieve_harness):
     }
 
     # 4. OUTPUT SHAPE - ids re-encoded with the model for the round-trip.
-    assert resp.id == encode_file_id_with_model("batch-provider-id", "azure/gpt-4o", id_type="batch")
+    assert resp.id == encode_file_id_with_model("batch-provider-id", "azure/gpt-4o", id_type="batch", user_id="caller-user", team_id="caller-team")
 
     # write-back to the managed-object table happened, tagged as a retrieve.
     assert retrieve_harness.update_batch_in_db.call_count == 1
@@ -1097,7 +1112,7 @@ async def test_retrieve__model_encoded_id__forwards_decoded_model_not_deployment
     """Regression guard for the line-483 override: the model forwarded to the
     provider must be the decoded model id, never the deployment name that the
     credential merge pulled in. Dropping the override silently 400s bedrock."""
-    await call_retrieve(retrieve_harness, AZURE_BATCH_ID)
+    await call_retrieve(retrieve_harness, AZURE_BATCH_ID, user=IDENTIFIED_CALLER)
 
     assert retrieve_harness.aretrieve_kwargs()["model"] == "azure/gpt-4o"
 
@@ -1112,10 +1127,10 @@ async def test_retrieve__model_encoded_id__encodes_output_and_error_ids(
         error_file_id="file-err-raw",
     )
 
-    resp = await call_retrieve(retrieve_harness, AZURE_BATCH_ID)
+    resp = await call_retrieve(retrieve_harness, AZURE_BATCH_ID, user=IDENTIFIED_CALLER)
 
-    assert resp.output_file_id == encode_file_id_with_model("file-out-raw", "azure/gpt-4o")
-    assert resp.error_file_id == encode_file_id_with_model("file-err-raw", "azure/gpt-4o")
+    assert resp.output_file_id == encode_file_id_with_model("file-out-raw", "azure/gpt-4o", user_id="caller-user", team_id="caller-team")
+    assert resp.error_file_id == encode_file_id_with_model("file-err-raw", "azure/gpt-4o", user_id="caller-user", team_id="caller-team")
 
 
 @pytest.mark.asyncio
@@ -1123,7 +1138,7 @@ async def test_retrieve__model_encoded_beats_loadbalancing(retrieve_harness):
     """Precedence: model-encoded id is checked before the loadbalancing/unified
     elif, so it wins even with loadbalancing enabled."""
     with patch.object(litellm, "enable_loadbalancing_on_batch_endpoints", True):
-        await call_retrieve(retrieve_harness, AZURE_BATCH_ID)
+        await call_retrieve(retrieve_harness, AZURE_BATCH_ID, user=IDENTIFIED_CALLER)
 
     assert retrieve_harness.litellm_aretrieve.call_count == 1
     retrieve_harness.router_aretrieve.assert_not_called()
@@ -1828,7 +1843,7 @@ async def call_cancel(
 
 @pytest.mark.asyncio
 async def test_cancel__model_encoded_id(cancel_harness):
-    resp = await call_cancel(cancel_harness, AZURE_BATCH_ID)
+    resp = await call_cancel(cancel_harness, AZURE_BATCH_ID, user=IDENTIFIED_CALLER)
 
     # DISPATCH - model-credential path via litellm; router untouched.
     assert cancel_harness.litellm_acancel.call_count == 1
@@ -1849,7 +1864,7 @@ async def test_cancel__model_encoded_id(cancel_harness):
     }
 
     # OUTPUT SHAPE - response id re-encoded with the DECODED model.
-    assert resp.id == encode_file_id_with_model("batch-provider-id", "azure/gpt-4o", id_type="batch")
+    assert resp.id == encode_file_id_with_model("batch-provider-id", "azure/gpt-4o", id_type="batch", user_id="caller-user", team_id="caller-team")
 
     # write-back tagged as a cancel.
     assert cancel_harness.update_batch_in_db.call_count == 1
@@ -1861,7 +1876,7 @@ async def test_cancel__model_encoded_id_forwards_deployment_model(cancel_harness
     """Pin the current contract: cancel forwards the creds' deployment model.
     If someone adds a decoded-model override (as retrieve has), this flips and
     must be reviewed."""
-    await call_cancel(cancel_harness, AZURE_BATCH_ID)
+    await call_cancel(cancel_harness, AZURE_BATCH_ID, user=IDENTIFIED_CALLER)
 
     assert cancel_harness.acancel_kwargs()["model"] == "azure/gpt-4o-deployment"
 
@@ -1869,7 +1884,7 @@ async def test_cancel__model_encoded_id_forwards_deployment_model(cancel_harness
 @pytest.mark.asyncio
 async def test_cancel__model_encoded_beats_unified(cancel_harness):
     with patch.object(endpoints, "_is_base64_encoded_unified_file_id", return_value=UNIFIED_BATCH_ID):
-        await call_cancel(cancel_harness, AZURE_BATCH_ID)
+        await call_cancel(cancel_harness, AZURE_BATCH_ID, user=IDENTIFIED_CALLER)
 
     assert cancel_harness.litellm_acancel.call_count == 1
     cancel_harness.router_acancel.assert_not_called()
@@ -2351,3 +2366,111 @@ async def test_cancel__model_encoded_id__binds_caller_to_minted_id(cancel_harnes
 # unreachable end-to-end today. Its unsigned contract is asserted by the strict
 # xfail test above (which goes live the day that branch is fixed) and by
 # test_model_based_routing_files_batches.py's sign=False unit coverage.
+
+
+# --------------------------------------------------------------------------- #
+# Ownership enforcement on model-embedded batch ids.
+#
+# These ids carry no database record, so the caller's identity is signed into
+# the id at mint time and verified here. Before this guard existed, any caller
+# holding a valid virtual key could forge one and read or cancel another
+# tenant's batch.
+# --------------------------------------------------------------------------- #
+
+VICTIM = UserAPIKeyAuth(api_key="sk-victim", user_id="victim-user", team_id="victim-team")
+ATTACKER = UserAPIKeyAuth(api_key="sk-attacker", user_id="attacker-user", team_id="attacker-team")
+VICTIM_TEAMMATE = UserAPIKeyAuth(api_key="sk-mate", user_id="other-user", team_id="victim-team")
+
+
+def _forged_unsigned_batch_id() -> str:
+    """What an attacker can build unaided: no server secret is needed."""
+    payload = "litellm:batch_victim_orig;model,azure/gpt-4o"
+    return "batch_" + base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def _victims_signed_batch_id() -> str:
+    return encode_file_id_with_model(
+        "batch_victim_orig",
+        "azure/gpt-4o",
+        id_type="batch",
+        user_id="victim-user",
+        team_id="victim-team",
+    )
+
+
+@pytest.mark.asyncio
+async def test_retrieve__forged_unsigned_id__denied(retrieve_harness, signing_salt):
+    with pytest.raises(ProxyException) as exc:
+        await call_retrieve(retrieve_harness, _forged_unsigned_batch_id(), user=ATTACKER)
+
+    assert int(exc.value.code or 0) == 403
+    retrieve_harness.litellm_aretrieve.assert_not_called()
+    retrieve_harness.router.aretrieve_batch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_retrieve__other_tenant_replaying_signed_id__denied(retrieve_harness, signing_salt):
+    with pytest.raises(ProxyException) as exc:
+        await call_retrieve(retrieve_harness, _victims_signed_batch_id(), user=ATTACKER)
+
+    assert int(exc.value.code or 0) == 403
+    retrieve_harness.litellm_aretrieve.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_retrieve__owner__allowed(retrieve_harness, signing_salt):
+    """Guards against the fix degenerating into a blanket deny."""
+    resp = await call_retrieve(retrieve_harness, _victims_signed_batch_id(), user=VICTIM)
+
+    assert resp is not None
+    retrieve_harness.litellm_aretrieve.assert_called_once()
+    assert retrieve_harness.litellm_aretrieve.call_args.kwargs["batch_id"] == "batch_victim_orig"
+
+
+@pytest.mark.asyncio
+async def test_retrieve__teammate_of_owner__allowed(retrieve_harness, signing_salt):
+    """Team sharing must match how can_access_resource scopes unified ids."""
+    resp = await call_retrieve(retrieve_harness, _victims_signed_batch_id(), user=VICTIM_TEAMMATE)
+
+    assert resp is not None
+    retrieve_harness.litellm_aretrieve.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cancel__forged_unsigned_id__denied(cancel_harness, signing_salt):
+    with pytest.raises(ProxyException) as exc:
+        await call_cancel(cancel_harness, _forged_unsigned_batch_id(), user=ATTACKER)
+
+    assert int(exc.value.code or 0) == 403
+    cancel_harness.litellm_acancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancel__other_tenant_replaying_signed_id__denied(cancel_harness, signing_salt):
+    with pytest.raises(ProxyException) as exc:
+        await call_cancel(cancel_harness, _victims_signed_batch_id(), user=ATTACKER)
+
+    assert int(exc.value.code or 0) == 403
+    cancel_harness.litellm_acancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancel__owner__allowed(cancel_harness, signing_salt):
+    resp = await call_cancel(cancel_harness, _victims_signed_batch_id(), user=VICTIM)
+
+    assert resp is not None
+    cancel_harness.litellm_acancel.assert_called_once()
+
+
+def test_plain_and_unified_ids_are_not_model_embedded():
+    """The guard must be a no-op for every id shape that is not model-embedded,
+    so plain provider ids and unified managed ids keep their own handling. The
+    retrieve/cancel handlers route those shapes through branches this module's
+    harness does not stub, so the property is asserted on the guard directly."""
+    from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import (
+        NotModelEmbedded,
+        verify_model_embedded_file_id,
+    )
+
+    for untouched in ("batch_plain_provider", "batch_orig123", UNIFIED_BATCH_ID):
+        assert isinstance(verify_model_embedded_file_id(untouched), NotModelEmbedded), untouched

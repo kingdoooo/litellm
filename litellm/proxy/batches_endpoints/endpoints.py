@@ -38,6 +38,9 @@ from litellm.proxy.openai_files_endpoints.common_utils import (
     resolve_output_file_ids_to_unified,
     update_batch_in_database,
 )
+from litellm.proxy.openai_files_endpoints.model_embedded_id_auth import (
+    authorize_model_embedded_file_id,
+)
 from litellm.proxy.utils import handle_exception_on_proxy, is_known_model
 from litellm.repositories.table_repositories import ManagedFileRepository
 from litellm.types.llms.openai import LiteLLMBatchCreateRequest
@@ -405,6 +408,8 @@ async def retrieve_batch(
     data: Dict = {}
     try:
         model_from_id = decode_model_from_file_id(batch_id)
+        authorize_model_embedded_file_id(batch_id, user_api_key_dict)
+
         _retrieve_batch_request = RetrieveBatchRequest(
             batch_id=batch_id,
         )
@@ -853,6 +858,7 @@ async def cancel_batch(
     try:
         # Check for encoded batch ID with model info
         model_from_id = decode_model_from_file_id(batch_id)
+        authorize_model_embedded_file_id(batch_id, user_api_key_dict)
 
         # Create CancelBatchRequest with batch_id to enable ownership checking
         _cancel_batch_request = CancelBatchRequest(
