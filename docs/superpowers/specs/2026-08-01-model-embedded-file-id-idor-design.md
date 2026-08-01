@@ -42,8 +42,27 @@ URI, never on the base64-wrapped form.
 
 A second, related defect affects `get_file` (`files_endpoints.py:940`) and
 `delete_file` (`:1132`): `if should_route:` is evaluated *before* the unified-id
-branch (`:961`, `:1152`). Appending `?model=X` to a legitimate unified id
-diverts it onto the model-routing path and away from the ownership check.
+branch (`:961`, `:1152`), so appending `?model=X` to a legitimate unified id
+steers it onto the model-routing path.
+
+**Correction (verified during implementation): this is not a second
+vulnerability.** An earlier draft of this spec claimed the `?model=X` steering
+also bypasses the unified id's ownership check. It does not. That check runs in
+the enterprise managed-files `async_pre_call_hook`
+(`enterprise/litellm_enterprise/proxy/hooks/managed_files.py:445-451`), gated on
+`call_type` (`afile_content` / `afile_retrieve` / `afile_delete`) rather than on
+which routing branch is taken, and all three handlers pass a matching
+`route_type` before any routing decision
+(`files_endpoints.py:637`, `:946`, `:1138`). Tested against the pre-fix code,
+all six combinations of three handlers with and without `?model=` already
+returned 403 with the provider never called.
+
+The placement of the new authorization call before the routing branch is still
+required, for the other reason: `handle_model_based_routing` decodes the id and
+the decoded inner value is what later reaches the provider, so a check placed
+after it would authorize the wrong string. That reason is regression-locked by a
+mutation test. The `?model=X` behaviour is covered by a characterization test
+that pins existing behaviour; the PR must not claim it fixes a second bypass.
 
 ### Scope relative to PR #31435
 
@@ -252,9 +271,12 @@ Every test below must fail if the corresponding logic is removed or mutated.
 4. **Team sharing still works.** Same team, different user; expect success.
    Fails if the check is tightened to creator-only, which would silently
    diverge from the unified path.
-5. **`?model=X` diversion closed.** A legitimate unified id plus `?model=X` on
-   `get_file` and `delete_file`; the ownership check must still run. Fails if
-   the call is placed inside the `should_route` arm.
+5. **`?model=X` does not disturb the unified check.** A legitimate unified id
+   plus `?model=X` on `get_file` and `delete_file`; the ownership check must
+   still run. This is a characterization test pinning behaviour that already
+   held, not proof of a bypass fixed; see the Correction above. What *is*
+   regression-locked is that moving the new call after the decode breaks the
+   forged-id tests.
 6. **Round-trip preserved.**
    `tests/test_litellm/proxy/test_batch_retrieve_bedrock.py:214` must still
    pass, proving the OSS Bedrock batch flow is intact.
