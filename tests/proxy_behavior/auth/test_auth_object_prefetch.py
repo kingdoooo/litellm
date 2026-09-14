@@ -28,6 +28,13 @@ def _dead_db() -> MagicMock:
     return prisma
 
 
+def _frozen_clock() -> float:
+    """Freeze the in-memory cache clock so prefetched entries can't expire between the warm-up write and the
+    getter reads. Org rows carry a 5s TTL, so under CI scheduling delay the real clock made the cache-hit
+    asserts fall through to the dead DB and flake."""
+    return 1_000_000.0
+
+
 async def test_join_binds_the_membership_to_the_requested_team(prisma):
     """A user in two teams with different member budgets must get the requested team's row."""
     run = uuid4().hex
@@ -58,7 +65,7 @@ async def test_join_binds_the_membership_to_the_requested_team(prisma):
             data={"user_id": user_id, "team_id": team_b, "litellm_budget_table": {"connect": {"budget_id": f"b-{run}"}}}
         )
 
-        cache = UserApiKeyCache(in_memory_cache=InMemoryCache(), redis_cache=None)
+        cache = UserApiKeyCache(in_memory_cache=InMemoryCache(clock=_frozen_clock), redis_cache=None)
         refs = AuthObjectRefs(user_id=user_id, team_id=team_a, membership_user_id=user_id, organization_id=org_id)
         await prefetch_auth_objects(refs=refs, user_api_key_cache=cache, prisma_client=prisma)
 
@@ -100,7 +107,7 @@ async def test_join_reads_team_model_aliases_from_the_mapped_column(prisma):
             where={"team_id": team_id}, include={"litellm_model_table": True}
         )
 
-        cache = UserApiKeyCache(in_memory_cache=InMemoryCache(), redis_cache=None)
+        cache = UserApiKeyCache(in_memory_cache=InMemoryCache(clock=_frozen_clock), redis_cache=None)
         refs = AuthObjectRefs(user_id=None, team_id=team_id, membership_user_id=None, organization_id=None)
         await prefetch_auth_objects(refs=refs, user_api_key_cache=cache, prisma_client=prisma)
 
@@ -144,7 +151,7 @@ async def test_join_reads_null_nested_lists_the_way_prisma_does(prisma):
             where={"user_id_team_id": {"user_id": user_id, "team_id": team_id}}, include={"litellm_budget_table": True}
         )
 
-        cache = UserApiKeyCache(in_memory_cache=InMemoryCache(), redis_cache=None)
+        cache = UserApiKeyCache(in_memory_cache=InMemoryCache(clock=_frozen_clock), redis_cache=None)
         refs = AuthObjectRefs(user_id=user_id, team_id=team_id, membership_user_id=user_id, organization_id=None)
         await prefetch_auth_objects(refs=refs, user_api_key_cache=cache, prisma_client=prisma)
 
